@@ -3,6 +3,7 @@ from vllm.v1.worker.gpu.sample import bad_words, gumbel, logprob, penalties, pro
 from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator
+from vllm.v1.sample import rejection_sampler as sample_rejection_sampler
 from vllm.v1.sample.ops import topk_topp_sampler
 
 from vllm_ascend.worker.v2.input_batch import post_update
@@ -21,10 +22,12 @@ from vllm_ascend.worker.v2.structured_outputs import _apply_grammar_bitmask_kern
 penalties.apply_penalties = apply_penalties
 # because sampler.py and speculator.py are imported before this patch, they must be overridden
 sampler.gumbel_sample = gumbel_sample
+sampler.apply_top_k_top_p = npu_apply_top_k_top_p
 input_batch.post_update = post_update
 prompt_logprob.compute_topk_logprobs = compute_topk_logprobs
 sampler.compute_topk_logprobs = compute_topk_logprobs
 rejection_sampler.compute_topk_logprobs = compute_topk_logprobs
+states.apply_top_k_top_p = npu_apply_top_k_top_p
 states.apply_min_p = apply_min_p
 penalties.bincount = bincount
 speculator.gumbel_sample = gumbel_sample
@@ -38,3 +41,4 @@ rejection_sampler_utils.rejection_sample = npu_rejection_sample
 rejection_sampler.rejection_sample = npu_rejection_sample
 dflash_speculator._prepare_dflash_inputs_kernel = _prepare_dflash_inputs_kernel_ascend
 topk_topp_sampler.apply_top_k_top_p = npu_apply_top_k_top_p
+sample_rejection_sampler.apply_top_k_top_p = npu_apply_top_k_top_p
