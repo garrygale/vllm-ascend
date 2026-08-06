@@ -192,6 +192,22 @@ class ModelWithContext(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor):
         return self.original_model.markov_bias(markov_embed)
 
+    def embed_tokens(self, token_ids: torch.Tensor):
+        return self.original_model.embed_tokens(token_ids)
+
+    def domino_gru_forward(self, embeds: torch.Tensor, h: torch.Tensor | None = None):
+        return self.original_model.domino_gru_forward(embeds, h)
+
+    def domino_gru_cell(self, x: torch.Tensor, h: torch.Tensor):
+        return self.original_model.domino_gru_cell(x, h)
+
+    def correction_bias(self, features: torch.Tensor):
+        return self.original_model.correction_bias(features)
+
+    @property
+    def pure_draft_prefix_len(self) -> int:
+        return self.original_model.pure_draft_prefix_len
+
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)
 
