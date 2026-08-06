@@ -20,8 +20,6 @@
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.utils import vllm_version_is
-
 
 @triton.jit(do_not_specialize=["logits_stride", "vocab_size"])
 def _temperature_kernel(
@@ -68,10 +66,11 @@ def apply_temperature(
     # The previous value 44032 overflowed UB when vLLM v0.26+ stopped
     # upcasting logits to FP32 upstream and the kernel started receiving
     # BF16/FP16 logits (44032 * 48 bits = 2113536 bits > 1572864).
-    if vllm_version_is("0.26.0"):
-        BLOCK_SIZE = 32768
-    else:
-        BLOCK_SIZE = 44032
+    # Use the safe value unconditionally: 44032 overflows the A2/A3 UB
+    # whenever the kernel receives BF16/FP16 logits (44032 * 48 bits >
+    # 1572864 bits). 32768 keeps the BF16/FP16 logits plus FP32 working
+    # vector inside the UB limit on every supported branch.
+    BLOCK_SIZE = 32768
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     _temperature_kernel[(num_tokens, num_blocks)](
         logits,
@@ -209,6 +208,7 @@ def gumbel_sample(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
+        multibuffer=False,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
