@@ -239,6 +239,13 @@ def _apply_top_k_top_p_torch_npu(
     p: torch.Tensor,
     top_k: int | None = None,
 ) -> torch.Tensor:
+    # npu_top_k_top_p expects p in the same dtype as the logits (e.g. BF16),
+    # while sampling metadata carries p as FP32.
+    if p is not None and p.dtype != logits.dtype:
+        p = p.to(logits.dtype)
+    if k is not None and k.dtype != torch.int32:
+        k = k.to(torch.int32)
+
     if get_ascend_config().enable_reduce_sample:
         tp_group = get_tp_group()
         B, V_local = logits.shape
