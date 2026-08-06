@@ -35,6 +35,12 @@ def init_speculator(
         )
 
         return AscendDSparkSpeculator(vllm_config, device)
+    if speculative_config.use_domino():
+        from vllm_ascend.worker.v2.spec_decode.domino.speculator import (
+            AscendDominoSpeculator,
+        )
+
+        return AscendDominoSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
         from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
             AscendDFlashSpeculator,

@@ -273,7 +273,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 # tokens; dspark's threshold is just N by design.
                 if method == "dflash":
                     self.reorder_batch_threshold = 1 + num_spec
-                elif method == "dspark":
+                elif method in ("dspark", "domino"):
                     self.reorder_batch_threshold = num_spec
 
     def _copy_sequence_indices_to_device(
