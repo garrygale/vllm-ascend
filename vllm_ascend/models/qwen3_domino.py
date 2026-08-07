@@ -29,6 +29,11 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         super().load_weights(weights)
+        env_value = os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "").strip()
+        logger.info(
+            "Ascend Domino load_weights: VLLM_ASCEND_DOMINO_TRITON_GRU=%r",
+            env_value,
+        )
         self.model._gru_fp16 = {
             "weight_ih_l0": self.model.prefix_gru.weight_ih_l0.detach()
             .to(torch.float16)
@@ -39,7 +44,6 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         }
         self._use_domino_triton_gru = False
         self._domino_gi_table = None
-        env_value = os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "").strip()
         if env_value.lower() in ("1", "true", "yes", "on"):
             self._validate_domino_triton_gru()
         elif env_value:

@@ -99,9 +99,15 @@ class AscendDominoSpeculator(DominoSpeculator):
         (Gumbel/top-k/top-p) is unaffected.
         """
         if not getattr(self.model, "_use_domino_triton_gru", False):
+            logger.info_once(
+                "Domino triton GRU disabled in speculator (env=%r)",
+                os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", ""),
+            )
             super()._sample_sequential(num_reqs, head_hidden)
             self._maybe_log_draft_tokens(num_reqs, "manual")
             return
+
+        logger.info_once("Domino triton GRU active in speculator")
 
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
