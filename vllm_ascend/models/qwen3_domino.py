@@ -39,8 +39,15 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         }
         self._use_domino_triton_gru = False
         self._domino_gi_table = None
-        if os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "0") == "1":
+        env_value = os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "").strip()
+        if env_value.lower() in ("1", "true", "yes", "on"):
             self._validate_domino_triton_gru()
+        elif env_value:
+            logger.warning(
+                "VLLM_ASCEND_DOMINO_TRITON_GRU=%r is not a recognized truthy "
+                "value; Domino triton GRU stays disabled (use 1)",
+                env_value,
+            )
 
     def _validate_domino_triton_gru(self) -> None:
         """Check the triton-table path is usable; tables build lazily.
@@ -68,6 +75,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 "and use_hidden_proj=false"
             )
         self._use_domino_triton_gru = True
+        logger.info(
+            "Domino triton GRU requested; tables will build lazily on "
+            "first use"
+        )
 
     def _ensure_domino_triton_gru(self) -> None:
         """Lazily precompute the triton-table cell + fused-h tensors.
