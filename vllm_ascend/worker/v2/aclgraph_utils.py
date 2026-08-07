@@ -204,9 +204,29 @@ class ModelWithContext(nn.Module):
     def correction_bias(self, features: torch.Tensor):
         return self.original_model.correction_bias(features)
 
+    def domino_z_part(self, sample_hidden: torch.Tensor):
+        return self.original_model.domino_z_part(sample_hidden)
+
+    def domino_optimized_prefix(self, token_ids: torch.Tensor):
+        return self.original_model.domino_optimized_prefix(token_ids)
+
+    def domino_optimized_bias_and_gh(
+        self, h: torch.Tensor, z_part_i: torch.Tensor
+    ):
+        return self.original_model.domino_optimized_bias_and_gh(h, z_part_i)
+
+    def domino_optimized_cell(
+        self, token_ids: torch.Tensor, h: torch.Tensor, gh: torch.Tensor
+    ):
+        return self.original_model.domino_optimized_cell(token_ids, h, gh)
+
     @property
     def pure_draft_prefix_len(self) -> int:
         return self.original_model.pure_draft_prefix_len
+
+    @property
+    def _use_domino_triton_gru(self) -> bool:
+        return getattr(self.original_model, "_use_domino_triton_gru", False)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)

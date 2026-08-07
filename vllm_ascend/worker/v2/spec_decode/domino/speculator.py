@@ -84,6 +84,77 @@ class AscendDominoSpeculator(DominoSpeculator):
             )
         return [attn_metadata]
 
+    def _sample_sequential(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        """Triton-table GRU + fused-h zpart correction loop.
+
+        Enabled by ``VLLM_ASCEND_DOMINO_TRITON_GRU=1`` (and TP=1).  Falls back
+        to the base manual implementation otherwise.  The correction head
+        still produces full logits through the aclnn fc2 matmul, so sampling
+        (Gumbel/top-k/top-p) is unaffected.
+        """
+        if not getattr(self.model, "_use_domino_triton_gru", False):
+            return super()._sample_sequential(num_reqs, head_hidden)
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+
+        base_logits = self.model.compute_draft_logits(sample_hidden)
+        vocab_size = base_logits.shape[-1]
+        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+
+        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+
+        prefix_len = int(getattr(self.model, "pure_draft_prefix_len", 0))
+        if prefix_len > n_spec:
+            raise ValueError(
+                f"Domino pure_draft_prefix_len ({prefix_len}) cannot exceed "
+                f"num_speculative_tokens ({n_spec})"
+            )
+
+        anchor = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        prefix_ids = torch.empty(
+            num_reqs,
+            1 + prefix_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        prefix_ids[:, 0] = anchor
+        for i in range(prefix_len):
+            draft_i = self._sample_step(
+                base_logits[:, i],
+                idx_map[:, i],
+                sample_pos[:, i],
+                i,
+            )
+            self.draft_tokens[:num_reqs, i] = draft_i
+            prefix_ids[:, 1 + i] = draft_i
+
+        gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
+
+        sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
+        z_part = self.model.domino_z_part(sample_hidden_3d)
+
+        for i in range(prefix_len, n_spec):
+            bias, gh = self.model.domino_optimized_bias_and_gh(
+                gru_hidden, z_part[:, i]
+            )
+            logits_i = base_logits[:, i] + bias
+            draft_i = self._sample_step(
+                logits_i,
+                idx_map[:, i],
+                sample_pos[:, i],
+                i,
+            )
+            self.draft_tokens[:num_reqs, i] = draft_i
+            if i + 1 < n_spec:
+                gru_hidden = self.model.domino_optimized_cell(
+                    draft_i, gru_hidden, gh
+                )
+
     def propose(
         self,
         input_batch: InputBatch,
