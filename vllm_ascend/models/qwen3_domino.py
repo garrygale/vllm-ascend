@@ -8,14 +8,11 @@ from collections.abc import Iterable
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton,
 )
-
-logger = init_logger(__name__)
 
 
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
@@ -30,9 +27,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         super().load_weights(weights)
         env_value = os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "").strip()
-        logger.info(
-            "Ascend Domino load_weights: VLLM_ASCEND_DOMINO_TRITON_GRU=%r",
-            env_value,
+        print(
+            f"[AscendDomino] load_weights: "
+            f"VLLM_ASCEND_DOMINO_TRITON_GRU={env_value!r}",
+            flush=True,
         )
         self.model._gru_fp16 = {
             "weight_ih_l0": self.model.prefix_gru.weight_ih_l0.detach()
@@ -47,10 +45,11 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         if env_value.lower() in ("1", "true", "yes", "on"):
             self._validate_domino_triton_gru()
         elif env_value:
-            logger.warning(
-                "VLLM_ASCEND_DOMINO_TRITON_GRU=%r is not a recognized truthy "
-                "value; Domino triton GRU stays disabled (use 1)",
-                env_value,
+            print(
+                f"[AscendDomino] WARNING: VLLM_ASCEND_DOMINO_TRITON_GRU="
+                f"{env_value!r} is not a recognized truthy value; "
+                f"Domino triton GRU stays disabled (use 1)",
+                flush=True,
             )
 
     def _validate_domino_triton_gru(self) -> None:
@@ -59,15 +58,18 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         Only supports TP=1 and the ``embed_proj`` (no ``hidden_proj``) config.
         """
         if get_tensor_model_parallel_world_size() != 1:
-            logger.warning(
-                "VLLM_ASCEND_DOMINO_TRITON_GRU requires TP=1; "
-                "falling back to the manual GRU path."
+            print(
+                "[AscendDomino] WARNING: VLLM_ASCEND_DOMINO_TRITON_GRU "
+                "requires TP=1; falling back to the manual GRU path.",
+                flush=True,
             )
             return
         if getattr(self.model, "quant_config", None) is not None:
-            logger.warning(
-                "VLLM_ASCEND_DOMINO_TRITON_GRU is not supported with "
-                "quantized weights yet; falling back to the manual GRU path."
+            print(
+                "[AscendDomino] WARNING: VLLM_ASCEND_DOMINO_TRITON_GRU is "
+                "not supported with quantized weights yet; falling back to "
+                "the manual GRU path.",
+                flush=True,
             )
             return
         if (
@@ -77,11 +79,12 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             raise ValueError(
                 "VLLM_ASCEND_DOMINO_TRITON_GRU requires use_embed_proj=true "
                 "and use_hidden_proj=false"
-            )
+        )
         self._use_domino_triton_gru = True
-        logger.info(
-            "Domino triton GRU requested; tables will build lazily on "
-            "first use"
+        print(
+            "[AscendDomino] Domino triton GRU requested; tables will build "
+            "lazily on first use",
+            flush=True,
         )
 
     def _ensure_domino_triton_gru(self) -> None:
@@ -122,8 +125,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             * self._domino_gi_table.element_size()
             / 1e6
         )
-        logger.info(
-            "Domino triton GRU enabled (gi_table %.0f MB, TP=1)", mb
+        print(
+            f"[AscendDomino] Domino triton GRU enabled "
+            f"(gi_table {mb:.0f} MB, TP=1)",
+            flush=True,
         )
         self._use_domino_triton_gru = True
 

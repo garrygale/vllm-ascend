@@ -8,16 +8,12 @@ from typing import Any, cast
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.domino.speculator import DominoSpeculator
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
-
-logger = init_logger(__name__)
-
 
 class AscendDominoSpeculator(DominoSpeculator):
     _speculator_name = "Domino"
@@ -99,15 +95,15 @@ class AscendDominoSpeculator(DominoSpeculator):
         (Gumbel/top-k/top-p) is unaffected.
         """
         if not getattr(self.model, "_use_domino_triton_gru", False):
-            logger.info_once(
-                "Domino triton GRU disabled in speculator (env=%r)",
-                os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", ""),
+            self._log_triton_status(
+                "disabled (env="
+                f"{os.environ.get('VLLM_ASCEND_DOMINO_TRITON_GRU', '')!r})"
             )
             super()._sample_sequential(num_reqs, head_hidden)
             self._maybe_log_draft_tokens(num_reqs, "manual")
             return
 
-        logger.info_once("Domino triton GRU active in speculator")
+        self._log_triton_status("active")
 
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -169,6 +165,12 @@ class AscendDominoSpeculator(DominoSpeculator):
 
         self._maybe_log_draft_tokens(num_reqs, "triton")
 
+    def _log_triton_status(self, status: str) -> None:
+        if getattr(self, "_domino_triton_status_logged", False):
+            return
+        print(f"[AscendDomino] triton GRU in speculator: {status}", flush=True)
+        self._domino_triton_status_logged = True
+
     def _maybe_log_draft_tokens(self, num_reqs: int, path: str) -> None:
         if (
             os.environ.get("VLLM_ASCEND_DOMINO_TRITON_DEBUG", "0") != "1"
@@ -178,7 +180,8 @@ class AscendDominoSpeculator(DominoSpeculator):
             return
         n_spec = self.num_speculative_steps
         tokens = self.draft_tokens[0, :n_spec].tolist()
-        logger.info("domino %s draft tokens (first req): %s", path, tokens)
+        print(f"[AscendDomino] {path} draft tokens (first req): {tokens}",
+              flush=True)
 
     def propose(
         self,
