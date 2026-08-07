@@ -2,17 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.domino.speculator import DominoSpeculator
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+
+logger = init_logger(__name__)
 
 
 class AscendDominoSpeculator(DominoSpeculator):
@@ -95,7 +99,9 @@ class AscendDominoSpeculator(DominoSpeculator):
         (Gumbel/top-k/top-p) is unaffected.
         """
         if not getattr(self.model, "_use_domino_triton_gru", False):
-            return super()._sample_sequential(num_reqs, head_hidden)
+            super()._sample_sequential(num_reqs, head_hidden)
+            self._maybe_log_draft_tokens(num_reqs, "manual")
+            return
 
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -154,6 +160,15 @@ class AscendDominoSpeculator(DominoSpeculator):
                 gru_hidden = self.model.domino_optimized_cell(
                     draft_i, gru_hidden, gh
                 )
+
+        self._maybe_log_draft_tokens(num_reqs, "triton")
+
+    def _maybe_log_draft_tokens(self, num_reqs: int, path: str) -> None:
+        if os.environ.get("VLLM_ASCEND_DOMINO_TRITON_DEBUG", "0") != "1":
+            return
+        n_spec = self.num_speculative_steps
+        tokens = self.draft_tokens[0, :n_spec].tolist()
+        logger.info("domino %s draft tokens (first req): %s", path, tokens)
 
     def propose(
         self,
