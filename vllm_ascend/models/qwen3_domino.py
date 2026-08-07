@@ -38,17 +38,13 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             .contiguous(),
         }
         self._use_domino_triton_gru = False
+        self._domino_gi_table = None
         if os.environ.get("VLLM_ASCEND_DOMINO_TRITON_GRU", "0") == "1":
-            self._build_domino_triton_gru()
+            self._validate_domino_triton_gru()
 
-    def _build_domino_triton_gru(self) -> None:
-        """Precompute the triton-table cell + fused-h correction tensors.
+    def _validate_domino_triton_gru(self) -> None:
+        """Check the triton-table path is usable; tables build lazily.
 
-        Enables the validated benchmark winner:
-          * ``gi_table = emb_weight @ W_ih^T`` (replaces the per-step x matmul
-            with a gather),
-          * ``W_sh = cat([W_s, W_hh], dim=0)`` (one h projection shared by the
-            correction head and the GRU cell).
         Only supports TP=1 and the ``embed_proj`` (no ``hidden_proj``) config.
         """
         if get_tensor_model_parallel_world_size() != 1:
@@ -71,6 +67,25 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 "VLLM_ASCEND_DOMINO_TRITON_GRU requires use_embed_proj=true "
                 "and use_hidden_proj=false"
             )
+        self._use_domino_triton_gru = True
+
+    def _ensure_domino_triton_gru(self) -> None:
+        """Lazily precompute the triton-table cell + fused-h tensors.
+
+        Built on first use (not in ``load_weights``) because the draft
+        ``embed_tokens`` is replaced by the target's shared embedding *after*
+        weight loading; ``gi_table`` must come from the final shared table.
+          * ``gi_table = emb_weight @ W_ih^T`` (replaces the per-step x matmul
+            with a gather),
+          * ``W_sh = cat([W_s, W_hh], dim=0)`` (one h projection shared by the
+            correction head and the GRU cell).
+        """
+        if not self._use_domino_triton_gru:
+            raise RuntimeError(
+                "triton Domino GRU methods called but the path is not enabled"
+            )
+        if self._domino_gi_table is not None:
+            return
 
         H = self.model.target_hidden_size
         G = self.model.gru_hidden_dim
@@ -99,10 +114,12 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
 
     def domino_z_part(self, sample_hidden: torch.Tensor) -> torch.Tensor:
         """Precompute ``z @ W_z^T`` once per block: ``[B, steps, M]``."""
+        self._ensure_domino_triton_gru()
         return F.linear(sample_hidden, self._domino_w_z)
 
     def domino_optimized_prefix(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Run the table GRU over ``[B, 1+prefix_len]`` token ids."""
+        self._ensure_domino_triton_gru()
         B = token_ids.shape[0]
         G = self.model.gru_hidden_dim
         h = torch.zeros(
@@ -129,6 +146,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         ``sh = h @ W_sh^T`` is split into ``s_proj`` (correction) and ``gh``
         (cell), so the two per-step h matmuls become one.
         """
+        self._ensure_domino_triton_gru()
         sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
         s_proj = sh[:, : self.model.emb_dim]
         gh = sh[:, self.model.emb_dim:]
@@ -143,5 +161,6 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         gh: torch.Tensor,
     ) -> torch.Tensor:
         """Table-cell step with a precomputed ``gh``."""
+        self._ensure_domino_triton_gru()
         gi = self._domino_gi_table[token_ids]
         return domino_gru_cell_triton(gi, gh, h)

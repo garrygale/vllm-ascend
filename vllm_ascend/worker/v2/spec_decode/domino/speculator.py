@@ -164,7 +164,11 @@ class AscendDominoSpeculator(DominoSpeculator):
         self._maybe_log_draft_tokens(num_reqs, "triton")
 
     def _maybe_log_draft_tokens(self, num_reqs: int, path: str) -> None:
-        if os.environ.get("VLLM_ASCEND_DOMINO_TRITON_DEBUG", "0") != "1":
+        if (
+            os.environ.get("VLLM_ASCEND_DOMINO_TRITON_DEBUG", "0") != "1"
+            # tolist() is a host sync and is forbidden during ACL graph capture.
+            or torch.npu.is_current_stream_capturing()
+        ):
             return
         n_spec = self.num_speculative_steps
         tokens = self.draft_tokens[0, :n_spec].tolist()
