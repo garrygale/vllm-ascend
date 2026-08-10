@@ -367,7 +367,10 @@ def main() -> None:
         summary["num_draft_tokens"] = stats["num_draft_tokens"]
         summary["num_accepted_tokens"] = stats["num_accepted_tokens"]
 
-    summary_path = os.path.join(args.output_dir, "acceptance_summary.json")
+    stamp = datetime.now().strftime("%y%m%d_%H%M%S")
+    summary_path = os.path.join(
+        args.output_dir, f"acceptance_summary_{stamp}.json"
+    )
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
