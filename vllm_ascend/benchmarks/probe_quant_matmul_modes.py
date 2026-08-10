@@ -33,7 +33,7 @@ def run_eager(name: str, fn, ref):
         print(f"{name:28s} eager FAIL {type(exc).__name__}: {str(exc)[:200]}")
 
 
-def run_graph(name: str, fn, mode: str):
+def run_graph(name: str, fn, ref, mode: str):
     try:
         graph = torch.npu.NPUGraph()
         stream = torch.npu.Stream()
@@ -41,8 +41,11 @@ def run_graph(name: str, fn, mode: str):
         # fn() raises, so a failed combo cannot leak the capture state into
         # the rest of the probe.
         with torch.npu.graph(graph, stream=stream, capture_error_mode=mode):
-            fn()
-        print(f"{name:28s} graph[{mode:8s}] OK")
+            out = fn()
+        graph.replay()
+        torch.npu.synchronize()
+        err = (out.float() - ref.float()).abs().max().item()
+        print(f"{name:28s} graph[{mode:8s}] OK    max_err={err:.4f}")
     except Exception as exc:  # noqa: BLE001
         print(
             f"{name:28s} graph[{mode:8s}] FAIL "
@@ -58,14 +61,18 @@ def main() -> None:
     w8 = torch.randint(-127, 127, (N, K), device="npu")
     w4 = torch.randint(-7, 7, (N, K), device="npu")
 
-    # Reference: bf16 matmul of dequantized weights.
-    ref8 = (x.float() @ (w8.float() * 0.01).t())
-    ref4 = (x.float() @ (w4.float() * 0.01).t())
+    # Reference: bf16 matmul of weights dequantized with the same per-channel
+    # scales that are passed to the ops.  (An earlier version used an
+    # arbitrary 0.01 scale, which made the max error ~100x larger than the
+    # actual op error.)
+    scale8 = (w8.float().abs().amax(dim=1) / 127.0).clamp(min=1e-6).float()
+    scale4 = (w4.float().abs().amax(dim=1) / 7.0).clamp(min=1e-6).float()
+    ref8 = (x.float() @ (w8.float() * scale8.unsqueeze(1)).t())
+    ref4 = (x.float() @ (w4.float() * scale4.unsqueeze(1)).t())
 
     # --- A) W8A8: int8 x int8 -------------------------------------------
     xi8, xs = torch_npu.npu_dynamic_quant(x)  # int8 [M,K], per-token scale
     w8_t = w8.to(torch.int8).t().contiguous()  # [K,N]
-    scale8 = (w8.float().abs().amax(dim=1) / 127.0).clamp(min=1e-6).float()
 
     def a8w8():
         return torch_npu.npu_quant_matmul(
@@ -75,13 +82,12 @@ def main() -> None:
         )
 
     run_eager("A int8 x int8 (W8A8)", a8w8, ref8)
-    run_graph("A int8 x int8 (W8A8)", a8w8, "global")
-    run_graph("A int8 x int8 (W8A8)", a8w8, "relaxed")
+    run_graph("A int8 x int8 (W8A8)", a8w8, ref8, "global")
+    run_graph("A int8 x int8 (W8A8)", a8w8, ref8, "relaxed")
 
     # --- B) W4A8: int8 x int32-packed int4 ------------------------------
     w4_t = w4.t().contiguous().to(torch.int32)  # [K,N]
     w4_packed = torch_npu.npu_convert_weight_to_int4pack(w4_t)  # [K,N//8]
-    scale4 = (w4.float().abs().amax(dim=1) / 7.0).clamp(min=1e-6).float()
 
     def a8w4():
         return torch_npu.npu_quant_matmul(
@@ -91,8 +97,8 @@ def main() -> None:
         )
 
     run_eager("B int8 x int32 (W4A8)", a8w4, ref4)
-    run_graph("B int8 x int32 (W4A8)", a8w4, "global")
-    run_graph("B int8 x int32 (W4A8)", a8w4, "relaxed")
+    run_graph("B int8 x int32 (W4A8)", a8w4, ref4, "global")
+    run_graph("B int8 x int32 (W4A8)", a8w4, ref4, "relaxed")
 
     # --- C) W4A4: int32-packed x int32 ----------------------------------
     x4, x4s = torch_npu.npu_dynamic_quant(x, dst_type=torch.quint4x2)
@@ -108,8 +114,8 @@ def main() -> None:
         )
 
     run_eager("C int32 x int32 (W4A4)", a4w4, ref4)
-    run_graph("C int32 x int32 (W4A4)", a4w4, "global")
-    run_graph("C int32 x int32 (W4A4)", a4w4, "relaxed")
+    run_graph("C int32 x int32 (W4A4)", a4w4, ref4, "global")
+    run_graph("C int32 x int32 (W4A4)", a4w4, ref4, "relaxed")
 
 
 if __name__ == "__main__":
