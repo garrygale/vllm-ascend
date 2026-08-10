@@ -60,9 +60,8 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
 
         # On-the-fly per-channel quantization driven by the draft config
         # (dflash_config.qat_*).  Disable with VLLM_ASCEND_DOMINO_QUANT=0.
-        # The true W4A8 kernel only works in eager mode; when the draft runs
-        # in an ACL graph (enforce_eager=False), W4A8 layers are redirected
-        # to the graph-capturable W8A8 path.
+        # W4A8 (npu_weight_quant_batchmatmul, int4-packed int32) works in both
+        # eager and ACL graph mode, so no eager/graph redirect is needed.
         quant_env = os.environ.get("VLLM_ASCEND_DOMINO_QUANT", "").strip().lower()
         if quant_env in ("0", "false", "no", "off"):
             print(
@@ -71,19 +70,11 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 flush=True,
             )
         else:
-            spec_config = getattr(self.vllm_config, "speculative_config", None)
-            enforce_eager = bool(
-                spec_config is not None
-                and getattr(spec_config, "enforce_eager", False)
-            )
-            num_quantized = quantize_domino_model(
-                self.model, allow_w4a8=enforce_eager
-            )
+            num_quantized = quantize_domino_model(self.model)
             if num_quantized:
                 print(
                     f"[AscendDomino] On-the-fly quantization applied to "
-                    f"{num_quantized} draft linears "
-                    f"(draft eager={enforce_eager})",
+                    f"{num_quantized} draft linears",
                     flush=True,
                 )
 
