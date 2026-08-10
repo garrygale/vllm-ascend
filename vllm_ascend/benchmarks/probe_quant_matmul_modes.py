@@ -15,6 +15,8 @@ Tries the candidate quantized-matmul combos for the Domino draft:
      D4 int32-packed ND passed as a transposed view (doc-recommended
      per-channel layout: storage [N//8,K], logical [K,N//8] via .t()),
      D5 int32-packed forced back to ND base format, D6 NZ passed transposed
+  E) service-exact input_proj call shape (M=512, K=4096, N=2560, scale cast
+     inside the call like DominoW4A8LinearMethod.apply)
 
 The probe runs with ``allow_internal_format=True`` (set at the top of main)
 to mirror the serving environment: vllm-ascend sets this in
@@ -251,6 +253,31 @@ def main() -> None:
     run_eager("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4)
     run_graph("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4, "global")
     run_graph("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4, "relaxed")
+
+    # --- E) Service-exact input_proj call --------------------------------
+    # Same dims as the failing layer (draft input_proj 4096->2560) and the
+    # scale cast happens inside the closure, mirroring
+    # DominoW4A8LinearMethod.apply (weight_scale.to(x.dtype)).
+    M_E, K_E, N_E = 512, 4096, 2560
+    x_e = torch.randn(M_E, K_E, dtype=torch.bfloat16, device="npu")
+    w_e = torch.randint(-7, 7, (N_E, K_E), device="npu")
+    scale_e = (w_e.float().abs().amax(dim=1) / 7.0).clamp(min=1e-6).float()
+    ref_e = (x_e.float() @ (w_e.float() * scale_e.unsqueeze(1)).t())
+    w_e_packed = torch_npu.npu_convert_weight_to_int4pack(
+        w_e.t().contiguous().to(torch.int32)
+    )
+
+    def input_proj_call():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x_e,
+            w_e_packed,
+            antiquant_scale=scale_e.to(x_e.dtype),
+            antiquant_group_size=0,
+        )
+
+    run_eager("E input_proj 512x4096", input_proj_call, ref_e)
+    run_graph("E input_proj 512x4096", input_proj_call, ref_e, "global")
+    run_graph("E input_proj 512x4096", input_proj_call, ref_e, "relaxed")
 
 
 if __name__ == "__main__":
