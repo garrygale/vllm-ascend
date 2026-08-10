@@ -15,6 +15,11 @@ symmetric math as SpecForge's ``quantize_weight``:
   * layers listed in ``qat_w4a4_layers`` -> W4A4 via ``npu_dynamic_quant``
     (``quint4x2``) + ``npu_quant_matmul``.
 
+``npu_weight_quant_batchmatmul`` only accepts int4-packed int32 weights in
+eager mode (the ACL graph op on current CANN versions rejects DT_INT32
+matB), so W4A8 layers are redirected to W8A8 when the draft runs in graph
+mode (``allow_w4a8=False``).
+
 The Domino correction head (``prefix_gru``, ``embed_proj``/``hidden_proj``) is
 never quantized; ``qat_exclude`` is honored in addition.
 """
@@ -23,7 +28,6 @@ import torch
 import torch_npu
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
-from vllm_ascend.utils import maybe_trans_nz
 
 
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
@@ -154,17 +158,11 @@ def _quantize_w4a8(
     w_int: torch.Tensor,
     scale: torch.Tensor,
 ) -> None:
-    """Pack int4 weights and attach the per-channel W4A8 method in place.
-
-    Mirrors the existing W4A8 method: transpose to ``[K, N]``, convert to
-    FRACTAL_NZ (needed for ACL graph mode; enabled by default for quantized
-    dtypes via ``weight_nz_mode=1``), then pack to ``[K, N//8]``.
-    """
-    w_t = w_int.to(torch.int8).t().contiguous()
-    w_t = maybe_trans_nz(w_t)
-    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(
-        w_t.to(torch.int32)
-    )
+    """Pack int4 weights (op layout ``[input_size, output_size // 8]``) and
+    attach the per-channel W4A8 method in place.  Only used when the draft
+    runs eager, where ND int32 matB is supported."""
+    w_t = w_int.to(torch.int32).t().contiguous()
+    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(w_t)
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
@@ -220,8 +218,15 @@ def _is_w4a4_layer(path: str, w4a4: set[str]) -> bool:
     return False
 
 
-def quantize_domino_model(model: torch.nn.Module) -> int:
+def quantize_domino_model(model: torch.nn.Module, allow_w4a8: bool) -> int:
     """Quantize the Domino draft linears in place per ``dflash_config``.
+
+    Args:
+        model: the Domino draft model.
+        allow_w4a8: whether the true W4A8 kernel (int4-packed weights via
+            ``npu_weight_quant_batchmatmul``) may be used.  It only works when
+            the draft runs eager; in ACL graph mode W4A8 layers are redirected
+            to the graph-capturable W8A8 path.
 
     Returns the number of quantized linear layers (0 when the config does not
     request quantization).  The Domino correction head is always excluded.
@@ -251,10 +256,14 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
 
     # The Domino correction head is never quantized.
     exclude = qat_exclude | {"embed_proj", "hidden_proj"}
-    bulk_scheme = "W4A8" if qat_w_bit == 4 else "W8A8"
+    if qat_w_bit == 4:
+        bulk_scheme = "W4A8" if allow_w4a8 else "W8A8 (W4A8->W8A8 redirect)"
+    else:
+        bulk_scheme = "W8A8"
     print(
         f"[DominoQuant] quantizing draft: w_bit={qat_w_bit} a_bit={qat_a_bit} "
-        f"bulk={bulk_scheme} w4a4_layers={len(w4a4_layers)} "
+        f"allow_w4a8={allow_w4a8} bulk={bulk_scheme} "
+        f"w4a4_layers={len(w4a4_layers)} "
         f"excluded={sorted(exclude)}",
         flush=True,
     )
@@ -272,7 +281,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             )
             _quantize_w4a4(module, w_int, scale)
             scheme = "W4A4"
-        elif qat_w_bit == 4:
+        elif qat_w_bit == 4 and allow_w4a8:
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
             )

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
+from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 
@@ -24,6 +25,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     detects ``model._gru_fp16`` and casts per-step inputs to fp16 without
     mutating the bf16 parameters.
     """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.vllm_config = vllm_config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         super().load_weights(weights)
@@ -55,6 +60,9 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
 
         # On-the-fly per-channel quantization driven by the draft config
         # (dflash_config.qat_*).  Disable with VLLM_ASCEND_DOMINO_QUANT=0.
+        # The true W4A8 kernel only works in eager mode; when the draft runs
+        # in an ACL graph (enforce_eager=False), W4A8 layers are redirected
+        # to the graph-capturable W8A8 path.
         quant_env = os.environ.get("VLLM_ASCEND_DOMINO_QUANT", "").strip().lower()
         if quant_env in ("0", "false", "no", "off"):
             print(
@@ -63,11 +71,19 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 flush=True,
             )
         else:
-            num_quantized = quantize_domino_model(self.model)
+            spec_config = getattr(self.vllm_config, "speculative_config", None)
+            enforce_eager = bool(
+                spec_config is not None
+                and getattr(spec_config, "enforce_eager", False)
+            )
+            num_quantized = quantize_domino_model(
+                self.model, allow_w4a8=enforce_eager
+            )
             if num_quantized:
                 print(
                     f"[AscendDomino] On-the-fly quantization applied to "
-                    f"{num_quantized} draft linears",
+                    f"{num_quantized} draft linears "
+                    f"(draft eager={enforce_eager})",
                     flush=True,
                 )
 
