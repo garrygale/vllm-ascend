@@ -56,13 +56,11 @@ def quantize_weight_per_channel(
 class DominoW4A8LinearMethod(LinearMethodBase):
     """W4A8 dynamic quant via ``npu_weight_quant_batchmatmul``.
 
-    Weights are packed once at load time (int4 along the output dim, op layout
-    ``[input_size, output_size // 8]``).  The anti-quant scale is per-channel:
-    ``[1, output_size]`` with ``antiquant_group_size == input_size``.
+    Per-channel mode (``antiquant_group_size == 0``): weights stay as int8
+    (one int4 value per byte) in the op layout ``[input_size, output_size]``
+    and the anti-quant scale is ``[output_size]``, matching torch_npu's
+    ``LinearWeightQuant`` reference with ``antiquant_group_size=0``.
     """
-
-    def __init__(self, group_size: int) -> None:
-        self.group_size = group_size
 
     def create_weights(self, *args, **kwargs) -> None:
         return
@@ -80,7 +78,7 @@ class DominoW4A8LinearMethod(LinearMethodBase):
             x,
             layer.weight,
             antiquant_scale=layer.weight_scale.to(x.dtype),
-            antiquant_group_size=self.group_size,
+            antiquant_group_size=0,
         )
         if bias is not None:
             output = output + bias.to(output.dtype)
@@ -154,15 +152,14 @@ def _quantize_w4a8(
     layer,
     w_int: torch.Tensor,
     scale: torch.Tensor,
-    in_features: int,
 ) -> None:
-    """Pack int4 weights and attach the W4A8 method in place."""
-    w_t = w_int.to(torch.int32).t().contiguous()
-    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(w_t)
+    """Store per-channel int4 weights (one value per int8 byte) and attach the
+    W4A8 method in place."""
+    layer.weight.data = w_int.to(torch.int8).t().contiguous()
     layer.register_buffer(
-        "weight_scale", scale.reshape(1, -1).contiguous().to(torch.float32)
+        "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
-    layer.quant_method = DominoW4A8LinearMethod(group_size=in_features)
+    layer.quant_method = DominoW4A8LinearMethod()
 
 
 def _quantize_w8a8(
@@ -260,7 +257,6 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
         if _is_excluded(path, exclude):
             continue
 
-        in_features = module.weight.shape[1]
         if _is_w4a4_layer(path, w4a4_layers):
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
@@ -271,7 +267,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
             )
-            _quantize_w4a8(module, w_int, scale, in_features)
+            _quantize_w4a8(module, w_int, scale)
             scheme = "W4A8"
         else:
             w_int, scale = quantize_weight_per_channel(
