@@ -13,7 +13,13 @@ Tries the candidate quantized-matmul combos for the Domino draft:
      D1 int8 container [K,N], D2 int32-packed ND [K,N//8],
      D3 int32-packed NZ [K,N//8] (DSpark layout),
      D4 int32-packed ND passed as a transposed view (doc-recommended
-     per-channel layout: storage [N//8,K], logical [K,N//8] via .t())
+     per-channel layout: storage [N//8,K], logical [K,N//8] via .t()),
+     D5 int32-packed forced back to ND base format, D6 NZ passed transposed
+
+The probe runs with ``allow_internal_format=True`` (set at the top of main)
+to mirror the serving environment: vllm-ascend sets this in
+worker/model_runner_v1.py, which changes how ops such as
+``npu_convert_weight_to_int4pack`` store their output tensors.
 
 Each combo is executed eagerly and inside a ``torch.npu.NPUGraph`` capture
 under both GLOBAL and RELAXED capture modes, so we can see which ones the ACL
@@ -32,6 +38,14 @@ import torch_npu
 # Same value as vllm_ascend.utils.ACL_FORMAT_FRACTAL_NZ, inlined so the probe
 # stays standalone and does not pull in the full vllm-ascend package.
 ACL_FORMAT_FRACTAL_NZ = 29
+ACL_FORMAT_ND = 2
+
+
+def format_name(t: torch.Tensor) -> str:
+    try:
+        return str(torch_npu.get_npu_format(t))
+    except Exception:  # noqa: BLE001
+        return "?"
 
 
 def run_eager(name: str, fn, ref):
@@ -65,6 +79,11 @@ def run_graph(name: str, fn, ref, mode: str):
 
 def main() -> None:
     print(f"torch_npu version: {getattr(torch_npu, '__version__', 'unknown')}")
+    # Service-like storage: vllm-ascend sets allow_internal_format=True in
+    # worker/model_runner_v1.py; the default (False) is what the earlier
+    # probe runs used, which is why D2 passed there.
+    torch.npu.config.allow_internal_format = True
+    print("allow_internal_format=True (service-like)")
 
     M, K, N = 128, 2560, 1024
     x = torch.randn(M, K, dtype=torch.bfloat16, device="npu")
@@ -167,6 +186,13 @@ def main() -> None:
     w4_packed_nz = torch_npu.npu_convert_weight_to_int4pack(
         w4_t_nz
     )
+    # D5) Force the packed weight back to ND base format before the call.
+    w4_packed_nd = torch_npu.npu_format_cast(w4_packed, ACL_FORMAT_ND)
+    print(
+        "weight formats: "
+        f"i8={format_name(w4_i8)} packed={format_name(w4_packed)} "
+        f"nz={format_name(w4_packed_nz)} nd={format_name(w4_packed_nd)}"
+    )
 
     def wqb_packed_nz():
         return torch_npu.npu_weight_quant_batchmatmul(
@@ -196,6 +222,35 @@ def main() -> None:
     run_eager("D4 wqb int32 ND transposed", wqb_packed_t, ref4)
     run_graph("D4 wqb int32 ND transposed", wqb_packed_t, ref4, "global")
     run_graph("D4 wqb int32 ND transposed", wqb_packed_t, ref4, "relaxed")
+
+    # D5) int32-packed, explicitly cast back to ND base format.  Candidate
+    # fix if the pack op returns an internal format under
+    # allow_internal_format=True.
+    def wqb_packed_nd_forced():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_packed_nd,
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D5 wqb int32 ND forced", wqb_packed_nd_forced, ref4)
+    run_graph("D5 wqb int32 ND forced", wqb_packed_nd_forced, ref4, "global")
+    run_graph("D5 wqb int32 ND forced", wqb_packed_nd_forced, ref4, "relaxed")
+
+    # D6) int32-packed NZ passed as a transposed view.  The doc requires the
+    # weight to be the transposed input for NZ int32 in per-channel mode.
+    def wqb_packed_nz_t():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_packed_nz.t(),
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4)
+    run_graph("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4, "global")
+    run_graph("D6 wqb int32 NZ transposed", wqb_packed_nz_t, ref4, "relaxed")
 
 
 if __name__ == "__main__":
