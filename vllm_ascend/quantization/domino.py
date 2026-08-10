@@ -23,6 +23,7 @@ import torch
 import torch_npu
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm_ascend.utils import maybe_trans_nz
 
 
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
@@ -153,10 +154,17 @@ def _quantize_w4a8(
     w_int: torch.Tensor,
     scale: torch.Tensor,
 ) -> None:
-    """Pack int4 weights (op layout ``[input_size, output_size // 8]``) and
-    attach the per-channel W4A8 method in place."""
-    w_t = w_int.to(torch.int32).t().contiguous()
-    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(w_t)
+    """Pack int4 weights and attach the per-channel W4A8 method in place.
+
+    Mirrors the existing W4A8 method: transpose to ``[K, N]``, convert to
+    FRACTAL_NZ (needed for ACL graph mode; enabled by default for quantized
+    dtypes via ``weight_nz_mode=1``), then pack to ``[K, N//8]``.
+    """
+    w_t = w_int.to(torch.int8).t().contiguous()
+    w_t = maybe_trans_nz(w_t)
+    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(
+        w_t.to(torch.int32)
+    )
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )

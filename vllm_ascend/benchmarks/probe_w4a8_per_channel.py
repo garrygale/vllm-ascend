@@ -10,6 +10,8 @@ Validates three layouts for the Domino on-the-fly W4A8 path:
      (first working implementation, 1 byte/weight).
   B) int4-packed int32 ``[K, N//8]`` + per-channel scale, ``group_size=0``
      (WINNER: true 4-bit storage, 0.5 byte/weight; max err 0.0236 vs bf16).
+     Eager accepts ND; the ACL graph path requires the FRACTAL_NZ layout
+     (B-NZ below, via ``maybe_trans_nz``).
   C) int4-packed int32 + per-group scale 256 (DSpark/msModelSlim layout;
      kept as a reference only, scale orientation still needs care).
 
@@ -18,6 +20,8 @@ Run directly on an NPU:  ``python probe_w4a8_per_channel.py``
 
 import torch
 import torch_npu
+
+from vllm_ascend.utils import maybe_trans_nz
 
 
 def main() -> None:
@@ -47,6 +51,18 @@ def main() -> None:
         print(f"B int32 perchannel    max_err={err_b:.4f}")
     except Exception as exc:  # noqa: BLE001
         print(f"B int32 perchannel    FAILED: {exc}")
+
+    # B-NZ) int4-packed int32 in FRACTAL_NZ (the ACL-graph layout).
+    w_packed_nz = torch_npu.npu_convert_weight_to_int4pack(
+        maybe_trans_nz(w_t).to(torch.int32)
+    )
+    try:
+        out_bnz = torch_npu.npu_weight_quant_batchmatmul(
+            x, w_packed_nz, scale, antiquant_group_size=0)
+        err_bnz = (out_bnz.float() - ref_out).abs().max().item()
+        print(f"B-NZ int32 perchannel max_err={err_bnz:.4f}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"B-NZ int32 perchannel FAILED: {exc}")
 
     # C) int4-packed int32 + per-group 256 (fallback reference).
     g = 256
