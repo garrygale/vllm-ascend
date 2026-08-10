@@ -10,8 +10,12 @@ Tries the three candidate quantized-matmul combos for the Domino draft:
   B) int8 x int32-packed-int4       (W4A8; the aclnnQuantMatmulV5 combo)
   C) int32-packed-int4 x int32      (W4A4, current W4A4 subset path)
 
-Each combo is executed eagerly and inside a ``torch.npu.NPUGraph`` capture so
-we can see which ones the ACL graph mode accepts on the installed CANN.
+Each combo is executed eagerly and inside a ``torch.npu.NPUGraph`` capture
+under both GLOBAL and RELAXED capture modes, so we can see which ones the ACL
+graph mode accepts on the installed CANN.  Some quantized ops are rejected in
+GLOBAL capture mode with "supported only in the RELAXED mode", and the manual
+capture_begin/capture_end probe previously leaked the capture state when a
+combo failed, crashing the next op outside the graph.
 
 Run directly on an NPU:  ``python probe_quant_matmul_modes.py``
 """
@@ -29,17 +33,21 @@ def run_eager(name: str, fn, ref):
         print(f"{name:28s} eager FAIL {type(exc).__name__}: {str(exc)[:200]}")
 
 
-def run_graph(name: str, fn):
+def run_graph(name: str, fn, mode: str):
     try:
-        stream = torch.npu.Stream()
         graph = torch.npu.NPUGraph()
-        with torch.npu.stream(stream):
-            graph.capture_begin()
+        stream = torch.npu.Stream()
+        # torch.npu.graph always calls capture_end() in __exit__, even when
+        # fn() raises, so a failed combo cannot leak the capture state into
+        # the rest of the probe.
+        with torch.npu.graph(graph, stream=stream, capture_error_mode=mode):
             fn()
-            graph.capture_end()
-        print(f"{name:28s} graph OK")
+        print(f"{name:28s} graph[{mode:8s}] OK")
     except Exception as exc:  # noqa: BLE001
-        print(f"{name:28s} graph FAIL {type(exc).__name__}: {str(exc)[:200]}")
+        print(
+            f"{name:28s} graph[{mode:8s}] FAIL "
+            f"{type(exc).__name__}: {str(exc)[:200]}"
+        )
 
 
 def main() -> None:
@@ -67,7 +75,8 @@ def main() -> None:
         )
 
     run_eager("A int8 x int8 (W8A8)", a8w8, ref8)
-    run_graph("A int8 x int8 (W8A8)", a8w8)
+    run_graph("A int8 x int8 (W8A8)", a8w8, "global")
+    run_graph("A int8 x int8 (W8A8)", a8w8, "relaxed")
 
     # --- B) W4A8: int8 x int32-packed int4 ------------------------------
     w4_t = w4.t().contiguous().to(torch.int32)  # [K,N]
@@ -82,7 +91,8 @@ def main() -> None:
         )
 
     run_eager("B int8 x int32 (W4A8)", a8w4, ref4)
-    run_graph("B int8 x int32 (W4A8)", a8w4)
+    run_graph("B int8 x int32 (W4A8)", a8w4, "global")
+    run_graph("B int8 x int32 (W4A8)", a8w4, "relaxed")
 
     # --- C) W4A4: int32-packed x int32 ----------------------------------
     x4, x4s = torch_npu.npu_dynamic_quant(x, dst_type=torch.quint4x2)
@@ -98,7 +108,8 @@ def main() -> None:
         )
 
     run_eager("C int32 x int32 (W4A4)", a4w4, ref4)
-    run_graph("C int32 x int32 (W4A4)", a4w4)
+    run_graph("C int32 x int32 (W4A4)", a4w4, "global")
+    run_graph("C int32 x int32 (W4A4)", a4w4, "relaxed")
 
 
 if __name__ == "__main__":
