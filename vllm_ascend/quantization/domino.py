@@ -56,10 +56,10 @@ def quantize_weight_per_channel(
 class DominoW4A8LinearMethod(LinearMethodBase):
     """W4A8 dynamic quant via ``npu_weight_quant_batchmatmul``.
 
-    Per-channel mode (``antiquant_group_size == 0``): weights stay as int8
-    (one int4 value per byte) in the op layout ``[input_size, output_size]``
-    and the anti-quant scale is ``[output_size]``, matching torch_npu's
-    ``LinearWeightQuant`` reference with ``antiquant_group_size=0``.
+    Per-channel mode (``antiquant_group_size == 0``) with int4-packed int32
+    weights in the op layout ``[input_size, output_size // 8]`` and a 1D
+    per-channel scale ``[output_size]``.  Validated on NPU (probe
+    ``benchmarks/probe_w4a8_per_channel.py``: max err 0.0236 vs bf16).
     """
 
     def create_weights(self, *args, **kwargs) -> None:
@@ -153,9 +153,10 @@ def _quantize_w4a8(
     w_int: torch.Tensor,
     scale: torch.Tensor,
 ) -> None:
-    """Store per-channel int4 weights (one value per int8 byte) and attach the
-    W4A8 method in place."""
-    layer.weight.data = w_int.to(torch.int8).t().contiguous()
+    """Pack int4 weights (op layout ``[input_size, output_size // 8]``) and
+    attach the per-channel W4A8 method in place."""
+    w_t = w_int.to(torch.int32).t().contiguous()
+    layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(w_t)
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
