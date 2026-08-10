@@ -4,24 +4,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NPU probe for ``npu_quant_matmul`` dtype combos (eager + ACL graph).
 
-Tries the three candidate quantized-matmul combos for the Domino draft:
+Tries the candidate quantized-matmul combos for the Domino draft:
 
   A) int8 x int8                    (W8A8, current graph-mode redirect)
   B) int8 x int32-packed-int4       (W4A8; the aclnnQuantMatmulV5 combo)
   C) int32-packed-int4 x int32      (W4A4, current W4A4 subset path)
+  D) npu_weight_quant_batchmatmul W4A8 layouts (the DSpark op):
+     D1 int8 container [K,N], D2 int32-packed ND [K,N//8],
+     D3 int32-packed NZ [K,N//8] (DSpark layout)
 
 Each combo is executed eagerly and inside a ``torch.npu.NPUGraph`` capture
 under both GLOBAL and RELAXED capture modes, so we can see which ones the ACL
 graph mode accepts on the installed CANN.  Some quantized ops are rejected in
 GLOBAL capture mode with "supported only in the RELAXED mode", and the manual
 capture_begin/capture_end probe previously leaked the capture state when a
-combo failed, crashing the next op outside the graph.
+combo failed, crashing the next op outside the graph.  Errors are printed in
+full (no truncation) so they can be shared/pasted for diagnosis.
 
 Run directly on an NPU:  ``python probe_quant_matmul_modes.py``
 """
 
 import torch
 import torch_npu
+
+from vllm_ascend.utils import maybe_trans_nz
 
 
 def run_eager(name: str, fn, ref):
@@ -30,7 +36,7 @@ def run_eager(name: str, fn, ref):
         err = (out.float() - ref.float()).abs().max().item()
         print(f"{name:28s} eager OK   max_err={err:.4f}")
     except Exception as exc:  # noqa: BLE001
-        print(f"{name:28s} eager FAIL {type(exc).__name__}: {str(exc)[:200]}")
+        print(f"{name:28s} eager FAIL {type(exc).__name__}: {exc}")
 
 
 def run_graph(name: str, fn, ref, mode: str):
@@ -49,7 +55,7 @@ def run_graph(name: str, fn, ref, mode: str):
     except Exception as exc:  # noqa: BLE001
         print(
             f"{name:28s} graph[{mode:8s}] FAIL "
-            f"{type(exc).__name__}: {str(exc)[:200]}"
+            f"{type(exc).__name__}: {exc}"
         )
 
 
@@ -116,6 +122,58 @@ def main() -> None:
     run_eager("C int32 x int32 (W4A4)", a4w4, ref4)
     run_graph("C int32 x int32 (W4A4)", a4w4, ref4, "global")
     run_graph("C int32 x int32 (W4A4)", a4w4, ref4, "relaxed")
+
+    # --- D) W4A8 via npu_weight_quant_batchmatmul (the DSpark op) -------
+    # x stays bf16 (the op quantizes it internally when quant_scale is
+    # None), the anti-quant scale is bf16 per-channel [N] with group_size=0,
+    # matching DominoW4A8LinearMethod.
+    scale4_bf16 = scale4.to(torch.bfloat16)
+
+    # D1) int8 container: one int4 value per int8 byte, [K, N].
+    w4_i8 = w4.to(torch.int8).t().contiguous()
+
+    def wqb_i8():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_i8,
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D1 wqb int8 container", wqb_i8, ref4)
+    run_graph("D1 wqb int8 container", wqb_i8, ref4, "global")
+    run_graph("D1 wqb int8 container", wqb_i8, ref4, "relaxed")
+
+    # D2) int32-packed ND [K, N//8] (current eager Domino layout).
+    def wqb_packed_nd():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_packed,
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D2 wqb int32 ND", wqb_packed_nd, ref4)
+    run_graph("D2 wqb int32 ND", wqb_packed_nd, ref4, "global")
+    run_graph("D2 wqb int32 ND", wqb_packed_nd, ref4, "relaxed")
+
+    # D3) int32-packed FRACTAL_NZ [K, N//8] (DSpark layout: trans_nz before
+    # packing, same order as AscendW4A8DynamicLinearMethod).
+    w4_packed_nz = torch_npu.npu_convert_weight_to_int4pack(
+        maybe_trans_nz(w4_t).to(torch.int32)
+    )
+
+    def wqb_packed_nz():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_packed_nz,
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D3 wqb int32 NZ", wqb_packed_nz, ref4)
+    run_graph("D3 wqb int32 NZ", wqb_packed_nz, ref4, "global")
+    run_graph("D3 wqb int32 NZ", wqb_packed_nz, ref4, "relaxed")
 
 
 if __name__ == "__main__":
