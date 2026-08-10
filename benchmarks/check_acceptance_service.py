@@ -9,8 +9,9 @@ server's Prometheus spec-decode counters (``/metrics``) and computes that
 request's acceptance length from the delta, so we get per-prompt acceptance
 statistics without needing server-side per-token info in the response.
 
-Only one request is in flight at a time; the next prompt is sent immediately
-after the current one is answered.
+Each worker sends the next prompt immediately after the current one is
+answered; ``NUM_WORKERS`` controls how many prompts are in flight in parallel.
+Aggregate statistics are computed from metric snapshots around the whole run.
 
 Edit the CONFIG block below, then run:
     python benchmarks/check_acceptance_service.py
@@ -23,8 +24,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import statistics
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -45,6 +49,7 @@ DATASET_PATH = "/path/to/gsm8k_test.jsonl"
 MAX_TOKENS = 512          # generation upper bound; EOS stops earlier
 NUM_PROMPTS = -1          # -1 = all prompts
 OUTPUT_DIR = "results/domino_acceptance"
+NUM_WORKERS = 1           # parallel workers; each sends prompts sequentially
 STORE_PER_SAMPLE = False  # keep per-request rows in the summary JSON
 USE_CHAT_TEMPLATE = True  # send via /v1/chat/completions so the server
                           # applies the model's chat template (matches
@@ -207,7 +212,16 @@ def main() -> None:
         help="send via /v1/chat/completions so the server applies the "
         "model's chat template",
     )
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     args = parser.parse_args()
+
+    if args.num_workers < 1:
+        parser.error("--num-workers must be >= 1")
+    if args.per_sample and args.num_workers > 1:
+        parser.error(
+            "--per-sample is not supported with --num-workers > 1 "
+            "(per-request metric deltas are unreliable under concurrency)"
+        )
 
     base_url = f"http://{args.server_ip}:{args.server_port}"
     prompts = load_prompts(args.dataset_path, args.dataset)
@@ -308,19 +322,38 @@ def main() -> None:
             ),
         }
     else:
-        # Aggregate-only: two metric snapshots are enough.  The draft-weighted
-        # mean equals 1 + total_accepted / total_drafts.
-        for i, (task_id, prompt) in enumerate(prompts):
-            send_completion(
-                base_url,
-                args.served_model_name,
-                prompt,
-                args.max_tokens,
-                args.temperature,
-                args.use_chat_template,
-                CHAT_TEMPLATE_KWARGS,
-            )
-            print(f"[{i + 1}/{len(prompts)}] {task_id}")
+        # Aggregate-only: two metric snapshots around the whole run.  The
+        # draft-weighted mean equals 1 + total_accepted / total_drafts.
+        work_queue: queue.Queue = queue.Queue()
+        for idx, (task_id, prompt) in enumerate(prompts, start=1):
+            work_queue.put((idx, task_id, prompt))
+        print_lock = threading.Lock()
+
+        def _worker(worker_id: int) -> None:
+            while True:
+                try:
+                    idx, task_id, prompt = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+                send_completion(
+                    base_url,
+                    args.served_model_name,
+                    prompt,
+                    args.max_tokens,
+                    args.temperature,
+                    args.use_chat_template,
+                    CHAT_TEMPLATE_KWARGS,
+                )
+                with print_lock:
+                    print(f"[w{worker_id}] [{idx}/{len(prompts)}] {task_id}")
+
+        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            futures = [
+                executor.submit(_worker, w)
+                for w in range(args.num_workers)
+            ]
+            for future in futures:
+                future.result()
         time.sleep(METRICS_SETTLE_SECONDS)
         after_all = fetch_spec_decode_metrics(base_url)
         delta = metric_delta(before_all, after_all)
@@ -346,6 +379,7 @@ def main() -> None:
         "temperature": args.temperature,
         "dataset": args.dataset,
         "num_requests": len(prompts),
+        "num_workers": args.num_workers,
         "mean_acceptance_length": stats["mean_acceptance_length"],
         "num_valid_requests": stats["num_valid_requests"],
         "per_position_acceptance_rates": stats[
