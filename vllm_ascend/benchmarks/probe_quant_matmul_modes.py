@@ -27,7 +27,9 @@ Run directly on an NPU:  ``python probe_quant_matmul_modes.py``
 import torch
 import torch_npu
 
-from vllm_ascend.utils import maybe_trans_nz
+# Same value as vllm_ascend.utils.ACL_FORMAT_FRACTAL_NZ, inlined so the probe
+# stays standalone and does not pull in the full vllm-ascend package.
+ACL_FORMAT_FRACTAL_NZ = 29
 
 
 def run_eager(name: str, fn, ref):
@@ -159,8 +161,9 @@ def main() -> None:
 
     # D3) int32-packed FRACTAL_NZ [K, N//8] (DSpark layout: trans_nz before
     # packing, same order as AscendW4A8DynamicLinearMethod).
+    w4_t_nz = torch_npu.npu_format_cast(w4_t, ACL_FORMAT_FRACTAL_NZ)
     w4_packed_nz = torch_npu.npu_convert_weight_to_int4pack(
-        maybe_trans_nz(w4_t).to(torch.int32)
+        w4_t_nz
     )
 
     def wqb_packed_nz():
