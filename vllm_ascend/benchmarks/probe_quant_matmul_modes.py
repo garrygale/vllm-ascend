@@ -11,7 +11,9 @@ Tries the candidate quantized-matmul combos for the Domino draft:
   C) int32-packed-int4 x int32      (W4A4, current W4A4 subset path)
   D) npu_weight_quant_batchmatmul W4A8 layouts (the DSpark op):
      D1 int8 container [K,N], D2 int32-packed ND [K,N//8],
-     D3 int32-packed NZ [K,N//8] (DSpark layout)
+     D3 int32-packed NZ [K,N//8] (DSpark layout),
+     D4 int32-packed ND passed as a transposed view (doc-recommended
+     per-channel layout: storage [N//8,K], logical [K,N//8] via .t())
 
 Each combo is executed eagerly and inside a ``torch.npu.NPUGraph`` capture
 under both GLOBAL and RELAXED capture modes, so we can see which ones the ACL
@@ -177,6 +179,23 @@ def main() -> None:
     run_eager("D3 wqb int32 NZ", wqb_packed_nz, ref4)
     run_graph("D3 wqb int32 NZ", wqb_packed_nz, ref4, "global")
     run_graph("D3 wqb int32 NZ", wqb_packed_nz, ref4, "relaxed")
+
+    # D4) int32-packed ND as a transposed (non-contiguous) view: storage
+    # [N//8, K], logical [K, N//8] via .t().  This is the layout the doc
+    # recommends for per-channel ND (the per-channel scale then runs along
+    # the contiguous output-channel dimension).  The packed values are
+    # identical to D2; only the strides change.
+    def wqb_packed_t():
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            w4_packed.t(),
+            antiquant_scale=scale4_bf16,
+            antiquant_group_size=0,
+        )
+
+    run_eager("D4 wqb int32 ND transposed", wqb_packed_t, ref4)
+    run_graph("D4 wqb int32 ND transposed", wqb_packed_t, ref4, "global")
+    run_graph("D4 wqb int32 ND transposed", wqb_packed_t, ref4, "relaxed")
 
 
 if __name__ == "__main__":
