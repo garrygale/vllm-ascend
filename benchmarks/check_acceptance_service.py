@@ -46,6 +46,10 @@ MAX_TOKENS = 512          # generation upper bound; EOS stops earlier
 NUM_PROMPTS = -1          # -1 = all prompts
 OUTPUT_DIR = "results/domino_acceptance"
 STORE_PER_SAMPLE = False  # keep per-request rows in the summary JSON
+USE_CHAT_TEMPLATE = True  # send via /v1/chat/completions so the server
+                          # applies the model's chat template (matches
+                          # specforge's check_acceptance --use-chat-template)
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}  # Qwen3-specific
 REQUEST_TIMEOUT = 600     # seconds per request
 METRICS_SETTLE_SECONDS = 0.2  # allow counters to flush before reading
 
@@ -148,17 +152,31 @@ def send_completion(
     prompt: str,
     max_tokens: int,
     temperature: float,
+    use_chat_template: bool,
+    chat_template_kwargs: dict,
 ) -> int:
     """POST /v1/completions and return the number of completion tokens."""
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": False,
-    }
+    if use_chat_template:
+        endpoint = "/v1/chat/completions"
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+            "chat_template_kwargs": chat_template_kwargs,
+        }
+    else:
+        endpoint = "/v1/completions"
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
     resp = requests.post(
-        f"{base_url}/v1/completions", json=payload, timeout=REQUEST_TIMEOUT
+        f"{base_url}{endpoint}", json=payload, timeout=REQUEST_TIMEOUT
     )
     resp.raise_for_status()
     data = resp.json()
@@ -182,6 +200,13 @@ def main() -> None:
         default=STORE_PER_SAMPLE,
         help="store per-request rows in the summary JSON (default: off)",
     )
+    parser.add_argument(
+        "--use-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=USE_CHAT_TEMPLATE,
+        help="send via /v1/chat/completions so the server applies the "
+        "model's chat template",
+    )
     args = parser.parse_args()
 
     base_url = f"http://{args.server_ip}:{args.server_port}"
@@ -190,7 +215,8 @@ def main() -> None:
         prompts = prompts[: args.num_prompts]
     print(
         f"Server: {base_url}  model={args.served_model_name}  "
-        f"temperature={args.temperature}"
+        f"temperature={args.temperature}  "
+        f"chat_template={args.use_chat_template}"
     )
     print(f"Dataset: {args.dataset} ({len(prompts)} prompts)")
 
@@ -228,6 +254,8 @@ def main() -> None:
                 prompt,
                 args.max_tokens,
                 args.temperature,
+                args.use_chat_template,
+                CHAT_TEMPLATE_KWARGS,
             )
             time.sleep(METRICS_SETTLE_SECONDS)
             after = fetch_spec_decode_metrics(base_url)
@@ -289,6 +317,8 @@ def main() -> None:
                 prompt,
                 args.max_tokens,
                 args.temperature,
+                args.use_chat_template,
+                CHAT_TEMPLATE_KWARGS,
             )
             print(f"[{i + 1}/{len(prompts)}] {task_id}")
         time.sleep(METRICS_SETTLE_SECONDS)
