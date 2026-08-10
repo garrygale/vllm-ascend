@@ -13,6 +13,7 @@ from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton,
 )
+from vllm_ascend.quantization.domino import quantize_domino_model
 
 
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
@@ -51,6 +52,30 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 f"Domino triton GRU stays disabled (use 1)",
                 flush=True,
             )
+
+        # On-the-fly per-channel quantization driven by the draft config
+        # (dflash_config.qat_*).  Disable with VLLM_ASCEND_DOMINO_QUANT=0.
+        quant_env = os.environ.get("VLLM_ASCEND_DOMINO_QUANT", "").strip().lower()
+        if quant_env in ("0", "false", "no", "off"):
+            print(
+                "[AscendDomino] Domino quantization disabled by "
+                "VLLM_ASCEND_DOMINO_QUANT; keeping bf16 weights",
+                flush=True,
+            )
+        else:
+            num_quantized = quantize_domino_model(self.model)
+            if num_quantized:
+                print(
+                    f"[AscendDomino] On-the-fly quantization applied to "
+                    f"{num_quantized} draft linears",
+                    flush=True,
+                )
+
+        # Rebuild the fused context-KV buffers: after quantization the K/V
+        # weights are no longer floating point, so this disables the fused
+        # path and frees the bf16 buffers (per-layer quantized projections
+        # are used instead).
+        self.model._build_fused_kv_buffers()
 
     def _validate_domino_triton_gru(self) -> None:
         """Check the triton-table path is usable; tables build lazily.
