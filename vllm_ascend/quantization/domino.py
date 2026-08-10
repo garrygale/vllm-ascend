@@ -177,7 +177,10 @@ def _quantize_w8a8(
     """Store int8 weights (op layout ``[input_size, output_size]``) and attach
     the W8A8 method in place."""
     layer.weight.data = w_int.to(torch.int8).t().contiguous()
-    layer.register_buffer("weight_scale", scale.to(torch.float32))
+    # npu_quant_matmul requires a 1D per-channel scale (non G-B/B-B mode).
+    layer.register_buffer(
+        "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
+    )
     layer.quant_method = DominoW8A8LinearMethod()
 
 
@@ -192,7 +195,9 @@ def _quantize_w4a4(
         w_int.to(torch.int32)
     )
     layer.weight.data = packed.transpose(-1, -2)
-    layer.register_buffer("weight_scale", scale.to(torch.float32))
+    layer.register_buffer(
+        "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
+    )
     layer.quant_method = DominoW4A4LinearMethod()
 
 
