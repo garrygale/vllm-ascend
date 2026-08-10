@@ -39,17 +39,17 @@ import requests
 # ---------------------------------------------------------------------------
 
 SERVER_IP = "127.0.0.1"
-SERVER_PORT = 8000
-SERVED_MODEL_NAME = "Qwen/Qwen3-8B"
+SERVER_PORT = 4144
+SERVED_MODEL_NAME = "qwen35"
 TEMPERATURE = 0.0
 
 DATASET = "gsm8k"  # "humaneval" or "gsm8k"
 DATASET_PATH = "/path/to/gsm8k_test.jsonl"
 
-MAX_TOKENS = 512          # generation upper bound; EOS stops earlier
+MAX_TOKENS = 1024          # generation upper bound; EOS stops earlier
 NUM_PROMPTS = -1          # -1 = all prompts
 OUTPUT_DIR = "results/domino_acceptance"
-NUM_WORKERS = 1           # parallel workers; each sends prompts sequentially
+NUM_WORKERS = 6           # parallel workers; each sends prompts sequentially
 STORE_PER_SAMPLE = False  # keep per-request rows in the summary JSON
 USE_CHAT_TEMPLATE = True  # send via /v1/chat/completions so the server
                           # applies the model's chat template (matches
