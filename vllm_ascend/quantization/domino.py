@@ -161,14 +161,13 @@ def _quantize_w4a8(
     scale: torch.Tensor,
 ) -> None:
     """Pack int4 weights (op layout ``[input_size, output_size // 8]``) and
-    attach the per-channel W4A8 method in place.  Only used when the draft
-    runs eager, where ND int32 matB is supported."""
+    attach the per-channel W4A8 method in place."""
     w_t = w_int.to(torch.int32).t().contiguous()
     layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(w_t)
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
-    layer.quant_method = DominoW4A8LinearMethod()
+    _set_quant_method(layer, DominoW4A8LinearMethod())
 
 
 def _quantize_w8a8(
@@ -183,7 +182,7 @@ def _quantize_w8a8(
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
-    layer.quant_method = DominoW8A8LinearMethod()
+    _set_quant_method(layer, DominoW8A8LinearMethod())
 
 
 def _quantize_w4a4(
@@ -200,7 +199,24 @@ def _quantize_w4a4(
     layer.register_buffer(
         "weight_scale", scale.reshape(-1).contiguous().to(torch.float32)
     )
-    layer.quant_method = DominoW4A4LinearMethod()
+    _set_quant_method(layer, DominoW4A4LinearMethod())
+
+
+def _set_quant_method(layer, method) -> None:
+    """Replace the layer's quant method and keep the Ascend custom-op wrapper
+    in sync.
+
+    Ascend linear layers (``Ascend*ParallelLinear``) snapshot ``quant_method``
+    into their ``custom_op`` at construction time (``custom_op.update_attrs``
+    in ``vllm_ascend/ops/linear.py``).  On-the-fly quantization replaces
+    ``layer.quant_method`` afterwards, so without this sync the custom op
+    keeps calling the old unquantized GEMM with the quantized (int32/int8)
+    weight, which fails with "Tensor matB not implemented for DT_INT32/INT8".
+    """
+    layer.quant_method = method
+    custom_op = getattr(layer, "custom_op", None)
+    if custom_op is not None:
+        custom_op.quant_method = method
 
 
 def _is_excluded(path: str, exclude: set[str]) -> bool:
