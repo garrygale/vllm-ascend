@@ -203,39 +203,50 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
     per_sample = args.per_sample
-    results: list[dict] = [] if per_sample else None
-    acceptance_lengths: list[float] = []
-    total_drafts = 0
-    weighted_sum = 0.0
-    accepted_pos_total: dict[int, int] = {}
 
-    for i, (task_id, prompt) in enumerate(prompts):
-        before = fetch_spec_decode_metrics(base_url)
-        completion_tokens = send_completion(
-            base_url,
-            args.served_model_name,
-            prompt,
-            args.max_tokens,
-            args.temperature,
-        )
-        time.sleep(METRICS_SETTLE_SECONDS)
-        after = fetch_spec_decode_metrics(base_url)
-        delta = metric_delta(before, after)
+    def _per_pos_rates(accepted_per_pos: dict[int, int], total_drafts: int):
+        max_pos = max(accepted_per_pos, default=-1)
+        return [
+            accepted_per_pos.get(pos, 0) / total_drafts
+            if total_drafts > 0
+            else 0.0
+            for pos in range(max_pos + 1)
+        ]
 
-        num_drafts = delta["num_drafts"]
-        num_accepted = delta["num_accepted_tokens"]
-        acceptance_length = (
-            1 + num_accepted / num_drafts if num_drafts > 0 else None
-        )
-        if acceptance_length is not None:
-            acceptance_lengths.append(acceptance_length)
-            total_drafts += num_drafts
-            weighted_sum += acceptance_length * num_drafts
-            for pos, val in delta["accepted_per_pos"].items():
-                accepted_pos_total[pos] = accepted_pos_total.get(pos, 0) + val
+    if per_sample:
+        results: list[dict] = []
+        acceptance_lengths: list[float] = []
+        total_drafts = 0
+        weighted_sum = 0.0
+        accepted_pos_total: dict[int, int] = {}
 
-        if per_sample:
-            assert results is not None
+        for i, (task_id, prompt) in enumerate(prompts):
+            before = fetch_spec_decode_metrics(base_url)
+            completion_tokens = send_completion(
+                base_url,
+                args.served_model_name,
+                prompt,
+                args.max_tokens,
+                args.temperature,
+            )
+            time.sleep(METRICS_SETTLE_SECONDS)
+            after = fetch_spec_decode_metrics(base_url)
+            delta = metric_delta(before, after)
+
+            num_drafts = delta["num_drafts"]
+            num_accepted = delta["num_accepted_tokens"]
+            acceptance_length = (
+                1 + num_accepted / num_drafts if num_drafts > 0 else None
+            )
+            if acceptance_length is not None:
+                acceptance_lengths.append(acceptance_length)
+                total_drafts += num_drafts
+                weighted_sum += acceptance_length * num_drafts
+                for pos, val in delta["accepted_per_pos"].items():
+                    accepted_pos_total[pos] = (
+                        accepted_pos_total.get(pos, 0) + val
+                    )
+
             results.append(
                 {
                     "task_id": task_id,
@@ -247,38 +258,65 @@ def main() -> None:
                     "acceptance_length": acceptance_length,
                 }
             )
-        print(f"[{i + 1}/{len(prompts)}] {task_id}")
+            print(f"[{i + 1}/{len(prompts)}] {task_id}")
 
-    if acceptance_lengths:
-        simple_mean = statistics.mean(acceptance_lengths)
-        weighted_mean = weighted_sum / total_drafts if total_drafts > 0 else None
+        simple_mean = (
+            statistics.mean(acceptance_lengths)
+            if acceptance_lengths
+            else None
+        )
+        weighted_mean = (
+            weighted_sum / total_drafts if total_drafts > 0 else None
+        )
+        stats = {
+            "simple_mean_acceptance_length": simple_mean,
+            "weighted_mean_acceptance_length": weighted_mean,
+            "mean_acceptance_length": (
+                weighted_mean if weighted_mean is not None else simple_mean
+            ),
+            "num_valid_requests": len(acceptance_lengths),
+            "per_position_acceptance_rates": _per_pos_rates(
+                accepted_pos_total, total_drafts
+            ),
+        }
     else:
-        simple_mean = None
-        weighted_mean = None
-    max_pos = max(accepted_pos_total, default=-1)
-    per_pos_rates = [
-        accepted_pos_total.get(pos, 0) / total_drafts
-        if total_drafts > 0
-        else 0.0
-        for pos in range(max_pos + 1)
-    ]
+        # Aggregate-only: two metric snapshots are enough.  The draft-weighted
+        # mean equals 1 + total_accepted / total_drafts.
+        for i, (task_id, prompt) in enumerate(prompts):
+            send_completion(
+                base_url,
+                args.served_model_name,
+                prompt,
+                args.max_tokens,
+                args.temperature,
+            )
+            print(f"[{i + 1}/{len(prompts)}] {task_id}")
+        time.sleep(METRICS_SETTLE_SECONDS)
+        after_all = fetch_spec_decode_metrics(base_url)
+        delta = metric_delta(before_all, after_all)
+        total_drafts = delta["num_drafts"]
+        num_accepted = delta["num_accepted_tokens"]
+        mean_acceptance_length = (
+            1 + num_accepted / total_drafts if total_drafts > 0 else None
+        )
+        stats = {
+            "mean_acceptance_length": mean_acceptance_length,
+            "num_drafts": total_drafts,
+            "num_draft_tokens": delta["num_draft_tokens"],
+            "num_accepted_tokens": num_accepted,
+            "num_valid_requests": len(prompts) if total_drafts > 0 else 0,
+            "per_position_acceptance_rates": _per_pos_rates(
+                delta["accepted_per_pos"], total_drafts
+            ),
+        }
 
-    stats = {
-        "simple_mean_acceptance_length": simple_mean,
-        "weighted_mean_acceptance_length": weighted_mean,
-        "num_valid_requests": len(acceptance_lengths),
-        "per_position_acceptance_rates": per_pos_rates,
-    }
     summary = {
         "server": base_url,
         "served_model_name": args.served_model_name,
         "temperature": args.temperature,
         "dataset": args.dataset,
         "num_requests": len(prompts),
-        "simple_mean_acceptance_length": stats["simple_mean_acceptance_length"],
-        "weighted_mean_acceptance_length": stats[
-            "weighted_mean_acceptance_length"
-        ],
+        "mean_acceptance_length": stats["mean_acceptance_length"],
         "num_valid_requests": stats["num_valid_requests"],
         "per_position_acceptance_rates": stats[
             "per_position_acceptance_rates"
@@ -287,8 +325,17 @@ def main() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if per_sample:
-        assert results is not None
         summary["results"] = results
+        summary["simple_mean_acceptance_length"] = stats[
+            "simple_mean_acceptance_length"
+        ]
+        summary["weighted_mean_acceptance_length"] = stats[
+            "weighted_mean_acceptance_length"
+        ]
+    else:
+        summary["num_drafts"] = stats["num_drafts"]
+        summary["num_draft_tokens"] = stats["num_draft_tokens"]
+        summary["num_accepted_tokens"] = stats["num_accepted_tokens"]
 
     summary_path = os.path.join(args.output_dir, "acceptance_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -299,15 +346,22 @@ def main() -> None:
     print("Domino acceptance-length results")
     print(f"  Requests:            {len(prompts)}")
     print(f"  Valid (with drafts): {stats['num_valid_requests']}")
-    if stats["simple_mean_acceptance_length"] is not None:
+    if stats["mean_acceptance_length"] is not None:
         print(
-            "  Mean acceptance length (simple):   "
-            f"{stats['simple_mean_acceptance_length']:.2f}"
+            "  Mean acceptance length:            "
+            f"{stats['mean_acceptance_length']:.2f}"
         )
-        print(
-            "  Mean acceptance length (weighted): "
-            f"{stats['weighted_mean_acceptance_length']:.2f}"
-        )
+    if per_sample:
+        if stats["simple_mean_acceptance_length"] is not None:
+            print(
+                "  Mean acceptance length (simple):   "
+                f"{stats['simple_mean_acceptance_length']:.2f}"
+            )
+        if stats["weighted_mean_acceptance_length"] is not None:
+            print(
+                "  Mean acceptance length (weighted): "
+                f"{stats['weighted_mean_acceptance_length']:.2f}"
+            )
     per_pos = stats["per_position_acceptance_rates"]
     if per_pos:
         print("  Per-position acceptance rates: "
