@@ -1236,3 +1236,18 @@
 #    Future Plan:
 #       Remove this patch when NPU support UVA.
 #
+# ** 34. File: worker/patch_qwen3_domino.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.models.qwen3_domino.Qwen3DominoModel.precompute_and_store_context_kv`
+#    Why:
+#       DFlash-style fused context-KV precompute uses vLLM custom ops
+#       (`ops.rms_norm`, `ops.rotary_embedding`) that are not available on
+#       Ascend.
+#    How:
+#       Replace with the NPU-friendly implementation: module-based RMSNorm,
+#       per-layer k-norm loop, and in-place RoPE through the Ascend rotary
+#       module.
+#    Future Plan:
+#       Remove when vllm-ascend provides NPU implementations of these custom
+#       ops.
+#
