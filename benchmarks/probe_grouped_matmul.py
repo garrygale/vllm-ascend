@@ -206,51 +206,34 @@ def main() -> None:
     )
     ref = _ref_projection(x, w_ints, scales)
 
-    print("packed weight formats / cat / stack:")
+    print("packed weight formats / fused single-pack stack:")
     print(
         f"packed_k[0] format={_format_name(packed_k[0])} "
         f"packed_v[0] format={_format_name(packed_v[0])}"
     )
-    cat_asis = _try_layout(
-        "cat(packed_k, packed_v) as-is",
-        lambda: torch.cat([packed_k[0], packed_v[0]], dim=1),
-    )
-    stack_asis = _try_layout(
-        "stack(cat as-is) x7",
-        lambda: torch.stack(
-            [torch.cat([packed_k[l], packed_v[l]], dim=1) for l in range(D)],
-            dim=0,
-        ),
-    )
-    cat_nd = _try_layout(
-        "cat(ND-cast packed_k, packed_v)",
-        lambda: torch.cat(
-            [
-                torch_npu.npu_format_cast(packed_k[0], ACL_FORMAT_ND),
-                torch_npu.npu_format_cast(packed_v[0], ACL_FORMAT_ND),
-            ],
-            dim=1,
-        ),
-    )
-    w_cat_nd = _try_layout(
-        "stack(cat ND-cast) x7",
+    # Build the fused K+V packed weight per layer in ONE pack call.  Packing
+    # K and V separately and concatenating the packed tensors is NOT valid on
+    # this CANN (the op misreads the concatenated layout), so this is the only
+    # safe construction.
+    fused_packed_nd_list = _try_layout(
+        "fused single-pack x7 (pack cat([K,V]) once)",
         lambda: torch.stack(
             [
-                torch.cat(
-                    [
-                        torch_npu.npu_format_cast(packed_k[l], ACL_FORMAT_ND),
-                        torch_npu.npu_format_cast(packed_v[l], ACL_FORMAT_ND),
-                    ],
-                    dim=1,
+                torch_npu.npu_format_cast(
+                    _pack_int4(
+                        torch.cat([w_ints[l][0], w_ints[l][1]], dim=0)
+                    ),
+                    ACL_FORMAT_ND,
                 )
                 for l in range(D)
             ],
             dim=0,
         ),
     )
-    if w_cat_nd is None:
-        print("cannot build ND fused weights; aborting", flush=True)
+    if fused_packed_nd_list is None:
+        print("cannot build fused single-pack weights; aborting", flush=True)
         return
+    w_cat_nd = fused_packed_nd_list
 
     scale_2d_bf16 = torch.stack(
         [
@@ -262,19 +245,7 @@ def main() -> None:
     scale_list_bf16 = [scale_2d_bf16[l] for l in range(D)]
 
     print("-" * 60)
-    print("diagnostics (isolate pack / cat / scale semantics):")
-    fused_int_0 = torch.cat([w_ints[0][0], w_ints[0][1]], dim=0)  # [2N, K]
-    _diag(
-        "unpack(cat packed) == w_int (nibble b)",
-        torch.equal(_unpack_int4(w_cat_nd[0], OUT_N), fused_int_0.cpu()),
-    )
-    _diag(
-        "unpack(cat packed) == w_int (nibble 7-b)",
-        torch.equal(
-            _unpack_int4(w_cat_nd[0], OUT_N, reverse_nibbles=True),
-            fused_int_0.cpu(),
-        ),
-    )
+    print("diagnostics (isolate pack semantics):")
 
     # Single projection, packed once (D2-style, no cat): should be tiny.
     packed_k_nd = [
@@ -330,7 +301,6 @@ def main() -> None:
 
     # G1 inputs: single 3D weight + single 2D scale (doc shape [g, n]).
     w_3d = w_cat_nd
-    w_3d_asis = stack_asis
     weight_3d = [w_3d]
     scale_3d = [scale_2d_bf16]
     # G2 inputs: list of 2D weights + list of 1D scales.
@@ -348,12 +318,6 @@ def main() -> None:
             x, weight_3d, scale_3d, offset_3d, 2, group_list
         ))
     )
-    if w_3d_asis is not None:
-        variants.append(
-            ("G1a as-is formats", lambda: _grouped_call(
-                x, [w_3d_asis], [scale_2d_bf16], offset_3d, 3, group_list
-            ))
-        )
     variants.append(
         ("G2 split_item=3 list", lambda: _grouped_call(
             x, weight_list, scale_list, offset_list, 3, group_list
