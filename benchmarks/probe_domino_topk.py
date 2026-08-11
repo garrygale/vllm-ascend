@@ -89,7 +89,7 @@ def _check_correctness(device) -> None:
         corr_k = torch.einsum(
             "bm,bmk->bk", x_corr, wc_i.permute(1, 0, 2)
         )
-        ref = corr_full[:, i].gather(1, idx[:, i])
+        ref = corr_full.gather(1, idx[:, i])
         max_err = max(max_err, (corr_k - ref).abs().max().item())
         # Non-candidate entries must stay -inf after scatter.
         buf = torch.full_like(base[:, i], float("-inf"))
