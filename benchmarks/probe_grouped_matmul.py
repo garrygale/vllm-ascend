@@ -78,6 +78,7 @@ def _diag(name: str, ok: bool, detail: str = "") -> None:
 
 def _ref_projection(x: torch.Tensor, w_ints, scales) -> torch.Tensor:
     """fp32 reference: [D, T, 2*N_KV]."""
+    t_size = x.shape[0] // D
     refs = []
     for l in range(D):
         fused_int = torch.cat(
@@ -88,7 +89,7 @@ def _ref_projection(x: torch.Tensor, w_ints, scales) -> torch.Tensor:
             .to(torch.bfloat16)
             .float()
         )  # bf16-rounded, like the op input
-        x_l = x[l * T:(l + 1) * T].float()
+        x_l = x[l * t_size:(l + 1) * t_size].float()
         refs.append(x_l @ (fused_int * scale.unsqueeze(1)).t())
     return torch.stack(refs, dim=0)
 
@@ -112,16 +113,17 @@ def _grouped_call(
         group_list_type=0,
         output_dtype=torch.bfloat16,
     )[0]
-    return out.contiguous().view(D, T, OUT_N)
+    return out.contiguous().view(D, x.shape[0] // D, OUT_N)
 
 
 def _wqb_fallback(x: torch.Tensor, w_cat_nd, scale_2d_bf16) -> torch.Tensor:
     """Per-layer npu_weight_quant_batchmatmul baseline (7 calls)."""
+    t_size = x.shape[0] // D
     outs = []
     for l in range(D):
         outs.append(
             torch_npu.npu_weight_quant_batchmatmul(
-                x[l * T:(l + 1) * T],
+                x[l * t_size:(l + 1) * t_size],
                 w_cat_nd[l],
                 antiquant_scale=scale_2d_bf16[l],
                 antiquant_group_size=0,
