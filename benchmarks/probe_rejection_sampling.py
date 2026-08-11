@@ -82,6 +82,7 @@ def _build_inputs(
             expanded_local_pos,
             temperature,
             seed,
+            1,  # num_speculative_steps (one draft position per request)
         ],
         seed,
     )
