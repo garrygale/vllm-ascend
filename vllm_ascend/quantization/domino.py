@@ -307,7 +307,9 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     count = 0
     model._fused_kv_scheme = None
     model._use_fused_qkv = False
-    kv_target_pending: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+    kv_target_pending: dict[
+        int, dict[str, tuple[torch.Tensor, torch.Tensor, str]]
+    ] = {}
     qkv_pending: dict[
         int, dict[str, tuple[torch.Tensor, torch.Tensor, str]]
     ] = {}
@@ -339,6 +341,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 kv_target_pending.setdefault(layer_idx, {})[key] = (
                     w_int,
                     scale,
+                    "w4a8",
                 )
         else:
             w_int, scale = quantize_weight_per_channel(
@@ -346,6 +349,17 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             )
             _quantize_w8a8(module, w_int, scale)
             scheme = "W8A8"
+            _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w8a8")
+            if path.endswith(".k_proj_target") or path.endswith(
+                ".v_proj_target"
+            ):
+                layer_idx = int(path.split(".")[1])
+                key = "k" if path.endswith(".k_proj_target") else "v"
+                kv_target_pending.setdefault(layer_idx, {})[key] = (
+                    w_int,
+                    scale,
+                    "w8a8",
+                )
 
         count += 1
         print(
@@ -354,44 +368,57 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             flush=True,
         )
 
-    # Build the fused context-KV W4A8 buffers (single-pack of the concatenated
-    # K+V int4 matrix).  Concatenating two separately-packed tensors is NOT
-    # valid on this CANN, so this must happen here while the unpacked int4
-    # values are still available.
+    # Build the fused context-KV buffers (single-pack of the concatenated
+    # K+V matrix: int4 for W4A8, int8 for W8A8).  Concatenating two
+    # separately-packed int4 tensors is NOT valid on this CANN, so this must
+    # happen here while the unpacked values are still available.
     num_layers = model.config.num_hidden_layers
     if (
         not _fused_kv_force_per_layer()
         and len(kv_target_pending) == num_layers
         and all(
-            len(pair) == 2 for pair in kv_target_pending.values()
+            len(pair) == 3 for pair in kv_target_pending.values()
         )
     ):
         fused_weights = []
         fused_scales = []
+        fused_schemes = set()
         for i in range(num_layers):
-            w_int_k, scale_k = kv_target_pending[i]["k"]
-            w_int_v, scale_v = kv_target_pending[i]["v"]
-            fused_int = (
-                torch.cat([w_int_k, w_int_v], dim=0)
-                .to(torch.int32)
-                .t()
-                .contiguous()
-            )
-            packed = torch_npu.npu_convert_weight_to_int4pack(fused_int)
-            packed_nd = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
-            fused_weights.append(packed_nd)
-            fused_scales.append(
-                torch.cat([scale_k, scale_v])
-                .reshape(-1)
-                .to(torch.bfloat16)
+            w_int_k, scale_k, scheme_k = kv_target_pending[i]["k"]
+            w_int_v, scale_v, _ = kv_target_pending[i]["v"]
+            fused_int = torch.cat([w_int_k, w_int_v], dim=0)
+            fused_scale = torch.cat([scale_k, scale_v]).reshape(-1)
+            fused_schemes.add(scheme_k)
+            if scheme_k == "w4a8":
+                packed = torch_npu.npu_convert_weight_to_int4pack(
+                    fused_int.to(torch.int32).t().contiguous()
+                )
+                packed = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
+                fused_scale = fused_scale.to(torch.bfloat16)
+            elif scheme_k == "w8a8":
+                packed = fused_int.to(torch.int8).t().contiguous()
+            else:
+                raise RuntimeError(
+                    f"unsupported fused context-KV scheme: {scheme_k}"
+                )
+            fused_weights.append(packed)
+            fused_scales.append(fused_scale)
+        if len(fused_schemes) != 1:
+            raise RuntimeError(
+                "mixed fused context-KV schemes: "
+                f"{sorted(fused_schemes)}"
             )
         model._fused_kv_weight = torch.stack(fused_weights, dim=0)
         model._fused_kv_scale = torch.stack(fused_scales, dim=0)
-        model._fused_kv_offset = torch.zeros_like(model._fused_kv_scale)
-        model._fused_kv_scheme = "w4a8"
+        model._fused_kv_scheme = fused_schemes.pop()
+        model._fused_kv_offset = (
+            torch.zeros_like(model._fused_kv_scale)
+            if model._fused_kv_scheme == "w4a8"
+            else None
+        )
         print(
             f"[DominoQuant] fused context-KV buffers built for "
-            f"{num_layers} layers (W4A8 single-pack)",
+            f"{num_layers} layers ({model._fused_kv_scheme})",
             flush=True,
         )
 
@@ -418,7 +445,10 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 )
                 packed = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
                 fused_scale = fused_scale.reshape(-1).to(torch.bfloat16)
-            else:
+            elif scheme == "w8a8":
+                packed = fused_int.to(torch.int8).t().contiguous()
+                fused_scale = fused_scale.reshape(-1)
+            else:  # w4a4
                 packed = torch_npu.npu_convert_weight_to_int4pack(
                     fused_int.to(torch.int32).contiguous()
                 ).transpose(-1, -2)
@@ -463,18 +493,20 @@ def _maybe_record_draft_qkv(
 def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
     """Enable the quantized fused context-KV path on the Domino draft model.
 
-    Consumes the fused W4A8 buffers built by :func:`quantize_domino_model`
-    (``_fused_kv_weight/_scale/_offset``) and fills in the same metadata the
-    bf16 fused path uses (hidden-norm, k-norm, RoPE, attn layers, kv dims).
-    The per-step ``group_list`` buffer is preallocated and updated in place
-    (``fill_(T)`` + ``cumsum_(0)``), so no per-call allocation is needed.
+    Consumes the fused W4A8/W8A8 buffers built by
+    :func:`quantize_domino_model` (``_fused_kv_weight/_scale``) and fills in
+    the same metadata the bf16 fused path uses (hidden-norm, k-norm, RoPE,
+    attn layers, kv dims).  The per-step ``group_list`` buffer is preallocated
+    and updated in place (``fill_(T)`` + ``cumsum_(0)``), so no per-call
+    allocation is needed.
 
     Returns True when the fused quantized path is active; otherwise the
     per-layer fallback remains in use.
     """
     if (
         _fused_kv_force_per_layer()
-        or getattr(model, "_fused_kv_scheme", None) != "w4a8"
+        or getattr(model, "_fused_kv_scheme", None)
+        not in ("w4a8", "w8a8")
     ):
         model._use_fused_context_kv = False
         return False

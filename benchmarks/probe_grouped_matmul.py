@@ -132,6 +132,78 @@ def _wqb_fallback(x: torch.Tensor, w_cat_nd, scale_2d_bf16) -> torch.Tensor:
     return torch.stack(outs, dim=0)
 
 
+def _proj_w8a8(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor):
+    x8, x8s = torch_npu.npu_dynamic_quant(x)
+    if x8s.dim() == 2:
+        x8s = x8s.squeeze(1)
+    return torch_npu.npu_quant_matmul(
+        x8,
+        w8,
+        scale,
+        pertoken_scale=x8s,
+        bias=None,
+        output_dtype=x.dtype,
+    )
+
+
+def _w8a8_fallback(x: torch.Tensor, w8_list, scale_2d) -> torch.Tensor:
+    """Per-layer npu_dynamic_quant + npu_quant_matmul baseline (7 calls)."""
+    t_size = x.shape[0] // D
+    outs = []
+    for l in range(D):
+        outs.append(
+            _proj_w8a8(
+                x[l * t_size:(l + 1) * t_size], w8_list[l], scale_2d[l]
+            )
+        )
+    return torch.stack(outs, dim=0)
+
+
+def _grouped_w8a8(
+    x: torch.Tensor,
+    w8_3d: torch.Tensor,
+    scale_2d: torch.Tensor,
+    group_list: torch.Tensor,
+) -> torch.Tensor:
+    """True W8A8 grouped: quantize the shared activation once, one matmul."""
+    x8, x8s = torch_npu.npu_dynamic_quant(x)
+    if x8s.dim() == 2:
+        x8s = x8s.squeeze(1)
+    out = torch_npu.npu_grouped_matmul(
+        x=[x8],
+        weight=[w8_3d],
+        scale=[scale_2d],
+        per_token_scale=[x8s],
+        group_list=group_list,
+        split_item=2,
+        group_type=0,
+        group_list_type=0,
+        output_dtype=torch.bfloat16,
+    )[0]
+    return out.contiguous().view(D, x.shape[0] // D, OUT_N)
+
+
+def _ref_w8a8(x: torch.Tensor, w8_ints, scale_2d) -> torch.Tensor:
+    """Formula-3 reference: (x8 @ w8) * weight_scale * per_token_scale."""
+    t_size = x.shape[0] // D
+    x8, x8s = torch_npu.npu_dynamic_quant(x)
+    if x8s.dim() == 2:
+        x8s = x8s.squeeze(1)
+    refs = []
+    for l in range(D):
+        fused = torch.cat(
+            [w8_ints[l][0], w8_ints[l][1]], dim=0
+        ).float()  # [2N, K]
+        x8_l = x8[l * t_size:(l + 1) * t_size].float()
+        s_l = x8s[l * t_size:(l + 1) * t_size].unsqueeze(1)
+        refs.append(
+            (x8_l @ fused.t())
+            * scale_2d[l].unsqueeze(0)
+            * s_l
+        )
+    return torch.stack(refs, dim=0)
+
+
 def _make_variants(
     x: torch.Tensor,
     group_list: torch.Tensor,
@@ -285,6 +357,40 @@ def main() -> None:
         ],
         dim=0,
     )  # [D, OUT_N]
+    # W8A8 fused int8 K+V weights (concatenating int8 tensors is safe).
+    w8_ints = []
+    w8_scales = []
+    for _ in range(D):
+        w8_ints.append(
+            (
+                torch.randint(
+                    -128, 127, (N_KV, K), dtype=torch.int32, device=device
+                ),
+                torch.randint(
+                    -128, 127, (N_KV, K), dtype=torch.int32, device=device
+                ),
+            )
+        )
+        w8_scales.append(
+            (
+                torch.rand(N_KV, device=device) * 0.9 + 0.1,
+                torch.rand(N_KV, device=device) * 0.9 + 0.1,
+            )
+        )
+    w8_cat_nd = torch.stack(
+        [
+            torch.cat([wi[0], wi[1]], dim=0)
+            .to(torch.int8)
+            .t()
+            .contiguous()
+            for wi in w8_ints
+        ],
+        dim=0,
+    )  # [D, K, 2N] int8
+    scale_8_2d = torch.stack(
+        [torch.cat([ws[0], ws[1]]) for ws in w8_scales],
+        dim=0,
+    )  # [D, 2N] fp32
     print("-" * 60)
     print("diagnostics (isolate pack semantics):")
 
@@ -333,6 +439,10 @@ def main() -> None:
     print("-" * 60)
 
     ref_wqb = _wqb_fallback(x, w_cat_nd, scale_2d_bf16)
+    ref8 = _ref_w8a8(x, w8_ints, scale_8_2d)
+    ref_w8 = _w8a8_fallback(
+        x, [w8_cat_nd[l] for l in range(D)], scale_8_2d
+    )
     offset_3d = [
         torch.zeros((D, OUT_N), dtype=torch.bfloat16, device=device)
     ]
@@ -344,17 +454,34 @@ def main() -> None:
     variants = _make_variants(
         x, group_list, w_cat_nd, scale_2d_bf16, offset_3d, offset_list
     )
+    variants.append(
+        ("G8 split_item=2 int8", lambda: _grouped_w8a8(
+            x, w8_cat_nd, scale_8_2d, group_list
+        ))
+    )
+    variants.append(
+        ("L8 per-layer int8", lambda: _w8a8_fallback(
+            x, [w8_cat_nd[l] for l in range(D)], scale_8_2d
+        ))
+    )
 
     print("-" * 60)
     all_ok = True
     for name, fn in variants:
         try:
             out = fn()
+            is_w8 = name.startswith("G8") or name.startswith("L8")
+            ref_use = ref8 if is_w8 else ref
+            ref_wqb_use = (
+                (None if name.startswith("L8") else ref_w8)
+                if is_w8
+                else (None if name.startswith("L ") else ref_wqb)
+            )
             all_ok &= _check(
                 f"{name} eager",
                 out,
-                ref,
-                None if name.startswith("L ") else ref_wqb,
+                ref_use,
+                ref_wqb_use,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"{name:34s} eager FAIL {type(exc).__name__}: {exc}", flush=True)
@@ -370,11 +497,18 @@ def main() -> None:
                 graph.replay()
                 torch.npu.synchronize()
                 replay_err = (out_g.float() - out.float()).abs().max().item()
+                is_w8 = name.startswith("G8") or name.startswith("L8")
+                ref_use = ref8 if is_w8 else ref
+                ref_wqb_use = (
+                    (None if name.startswith("L8") else ref_w8)
+                    if is_w8
+                    else (None if name.startswith("L ") else ref_wqb)
+                )
                 ok = _check(
                     f"{name} graph[{mode}]",
                     out_g,
-                    ref,
-                    None if name.startswith("L ") else ref_wqb,
+                    ref_use,
+                    ref_wqb_use,
                 )
                 all_ok &= ok and replay_err == 0.0
                 if replay_err != 0.0:
@@ -411,6 +545,16 @@ def main() -> None:
             scale_2d_bf16,
             offset_3d,
             offset_list,
+        )
+        variants_t.append(
+            ("G8 split_item=2 int8", lambda: _grouped_w8a8(
+                x_t, w8_cat_nd, scale_8_2d, group_list_t
+            ))
+        )
+        variants_t.append(
+            ("L8 per-layer int8", lambda: _w8a8_fallback(
+                x_t, [w8_cat_nd[l] for l in range(D)], scale_8_2d
+            ))
         )
         print(f"T={t_size}:", flush=True)
         for name, fn in variants_t:

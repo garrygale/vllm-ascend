@@ -107,6 +107,37 @@ def _build_case(scheme: str):
             )
         return sep, fused
 
+    if scheme == "w8a8":
+        fused = []
+        for _ in range(D):
+            w_int = torch.randint(
+                -128, 127, (NQKV, K), dtype=torch.int32, device=device
+            )
+            scale = (torch.rand(NQKV, device=device) * 0.9 + 0.1)
+            sep.append(
+                {
+                    "q": (
+                        w_int[:NQ].to(torch.int8).t().contiguous(),
+                        scale[:NQ],
+                    ),
+                    "k": (
+                        w_int[NQ:NQ + NKV].to(torch.int8).t().contiguous(),
+                        scale[NQ:NQ + NKV],
+                    ),
+                    "v": (
+                        w_int[NQ + NKV:].to(torch.int8).t().contiguous(),
+                        scale[NQ + NKV:],
+                    ),
+                }
+            )
+            fused.append(
+                (
+                    w_int.to(torch.int8).t().contiguous(),
+                    scale,
+                )
+            )
+        return sep, fused
+
     if scheme == "w4a4":
         fused = []
         for _ in range(D):
@@ -147,6 +178,20 @@ def _proj_w4a4(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
     ).to(x.dtype)
 
 
+def _proj_w8a8(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor):
+    x8, x8s = torch_npu.npu_dynamic_quant(x)
+    if x8s.dim() == 2:
+        x8s = x8s.squeeze(1)
+    return torch_npu.npu_quant_matmul(
+        x8,
+        w8,
+        scale,
+        pertoken_scale=x8s,
+        bias=None,
+        output_dtype=x.dtype,
+    )
+
+
 def _run_sep(scheme: str, x: torch.Tensor, sep) -> torch.Tensor:
     outs = []
     for l in range(D):
@@ -158,6 +203,10 @@ def _run_sep(scheme: str, x: torch.Tensor, sep) -> torch.Tensor:
             q = _proj_w4a8(x, *sep[l]["q"])
             k = _proj_w4a8(x, *sep[l]["k"])
             v = _proj_w4a8(x, *sep[l]["v"])
+        elif scheme == "w8a8":
+            q = _proj_w8a8(x, *sep[l]["q"])
+            k = _proj_w8a8(x, *sep[l]["k"])
+            v = _proj_w8a8(x, *sep[l]["v"])
         else:  # w4a4
             q = _proj_w4a4(x, *sep[l]["q"])
             k = _proj_w4a4(x, *sep[l]["k"])
@@ -174,6 +223,8 @@ def _run_fused(scheme: str, x: torch.Tensor, fused) -> torch.Tensor:
             qkv = _proj_bf16(x, w)
         elif scheme == "w4a8":
             qkv = _proj_w4a8(x, *fused[l])
+        elif scheme == "w8a8":
+            qkv = _proj_w8a8(x, *fused[l])
         else:  # w4a4
             qkv = _proj_w4a4(x, *fused[l])
         outs.append(qkv)
@@ -236,6 +287,7 @@ def main() -> None:
 
     sep_bf16, _ = _build_case("bf16")
     sep_w4a8, fused_w4a8 = _build_case("w4a8")
+    sep_w8a8, fused_w8a8 = _build_case("w8a8")
     sep_w4a4, fused_w4a4 = _build_case("w4a4")
 
     x = torch.randn(MS[0], K, dtype=torch.bfloat16, device=device)
@@ -249,6 +301,8 @@ def main() -> None:
          ) for l in range(D)])),
         ("w4a8", _run_sep("w4a8", x, sep_w4a8),
          _run_fused("w4a8", x, fused_w4a8)),
+        ("w8a8", _run_sep("w8a8", x, sep_w8a8),
+         _run_fused("w8a8", x, fused_w8a8)),
         ("w4a4", _run_sep("w4a4", x, sep_w4a4),
          _run_fused("w4a4", x, fused_w4a4)),
         ("mixed", _run_mixed_sep(x, sep_w4a4, sep_w4a8),
@@ -276,6 +330,8 @@ def main() -> None:
             )),
             ("w4a8 sep", lambda: _run_sep("w4a8", x_m, sep_w4a8)),
             ("w4a8 fus", lambda: _run_fused("w4a8", x_m, fused_w4a8)),
+            ("w8a8 sep", lambda: _run_sep("w8a8", x_m, sep_w8a8)),
+            ("w8a8 fus", lambda: _run_fused("w8a8", x_m, fused_w8a8)),
             ("w4a4 sep", lambda: _run_sep("w4a4", x_m, sep_w4a4)),
             ("w4a4 fus", lambda: _run_fused("w4a4", x_m, fused_w4a4)),
             ("mixed sep", lambda: _run_mixed_sep(x_m, sep_w4a4, sep_w4a8)),
