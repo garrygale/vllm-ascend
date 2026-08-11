@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Iterable
 
 import torch
@@ -53,44 +52,37 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         )
 
         # On-the-fly per-channel quantization driven by the draft config
-        # (dflash_config.qat_*).  Disable with VLLM_ASCEND_DOMINO_QUANT=0.
+        # (dflash_config.qat_*): qat_w_bit selects the W4A8/W8A8 bulk scheme
+        # and qat_w4a4_layers the per-layer W4A4; no qat_w_bit means bf16.
         # W4A8 (npu_weight_quant_batchmatmul, int4-packed int32) works in both
         # eager and ACL graph mode, so no eager/graph redirect is needed.
-        quant_env = os.environ.get("VLLM_ASCEND_DOMINO_QUANT", "").strip().lower()
+        num_quantized = quantize_domino_model(self.model)
         quant_fused = False
-        if quant_env in ("0", "false", "no", "off"):
+        if num_quantized:
             print(
-                "[AscendDomino] Domino quantization disabled by "
-                "VLLM_ASCEND_DOMINO_QUANT; keeping bf16 weights",
+                f"[AscendDomino] On-the-fly quantization applied to "
+                f"{num_quantized} draft linears",
                 flush=True,
             )
-        else:
-            num_quantized = quantize_domino_model(self.model)
-            if num_quantized:
+            quant_fused = build_quantized_fused_kv_buffers(self.model)
+            if quant_fused:
                 print(
-                    f"[AscendDomino] On-the-fly quantization applied to "
-                    f"{num_quantized} draft linears",
+                    "[AscendDomino] quantized fused context-KV "
+                    f"precompute enabled ({self.model._fused_kv_scheme})",
                     flush=True,
                 )
-                quant_fused = build_quantized_fused_kv_buffers(self.model)
-                if quant_fused:
-                    print(
-                        "[AscendDomino] quantized fused context-KV "
-                        f"precompute enabled ({self.model._fused_kv_scheme})",
-                        flush=True,
-                    )
-                if build_quantized_fused_qkv(self.model):
-                    print(
-                        "[AscendDomino] fused draft qkv projections enabled "
-                        "(quantized)",
-                        flush=True,
-                    )
-                if build_quantized_fused_norm_quant(self.model):
-                    print(
-                        "[AscendDomino] W8A8 fused norm+quant enabled "
-                        "(residual-stream draft layers + context-KV)",
-                        flush=True,
-                    )
+            if build_quantized_fused_qkv(self.model):
+                print(
+                    "[AscendDomino] fused draft qkv projections enabled "
+                    "(quantized)",
+                    flush=True,
+                )
+            if build_quantized_fused_norm_quant(self.model):
+                print(
+                    "[AscendDomino] W8A8 fused norm+quant enabled "
+                    "(residual-stream draft layers + context-KV)",
+                    flush=True,
+                )
 
         if not quant_fused:
             # bf16 path (quantization disabled) or unsupported quantized
