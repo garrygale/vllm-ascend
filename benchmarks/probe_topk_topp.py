@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """NPU probe for ``apply_top_k_top_p`` mask semantics.
 
-Compares the NPU top-k/top-p path used by the service (``npu_apply_top_k_top_p``
-from ``vllm_ascend.sample.sampler``, i.e. ``torch_npu.npu_top_k_top_p`` on
-A2/A3) against vLLM's reference semantics in
+Compares the NPU top-k/top-p op used by the service
+(``torch_npu.npu_top_k_top_p`` on A2/A3, with the same dtype casts as
+``vllm_ascend.sample.sampler._apply_top_k_top_p_torch_npu``) against vLLM's
+reference semantics in
 ``vllm.v1.sample.ops.topk_topp_sampler.apply_top_k_top_p_pytorch``:
 
   * top-k keeps all logits >= the k-th largest value (ties may keep more),
@@ -26,8 +27,6 @@ from __future__ import annotations
 
 import torch
 import torch_npu
-
-from vllm_ascend.sample.sampler import apply_top_k_top_p
 
 B, V = 8, 4096
 SEEDS = (0, 1, 2)
@@ -68,8 +67,15 @@ def _npu_apply(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Exact service path (handles dtype casts inside the Ascend wrapper)."""
-    return apply_top_k_top_p(logits.clone(), k, p)
+    """Service path: npu_top_k_top_p with the Ascend wrapper's dtype casts."""
+    logits = logits.clone()
+    if p is None and k is None:
+        return logits
+    if p is not None and p.dtype != logits.dtype:
+        p = p.to(logits.dtype)
+    if k is not None and k.dtype != torch.int32:
+        k = k.to(torch.int32)
+    return torch_npu.npu_top_k_top_p(logits, k=k, p=p)
 
 
 def _compare(name: str, npu_out: torch.Tensor, ref: torch.Tensor) -> bool:
