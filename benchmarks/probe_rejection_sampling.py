@@ -101,8 +101,12 @@ def _expected_acceptance(
     return min(1.0, p_target / p_draft)
 
 
-def _run_eager(args: list[object], draft_token: int, n_trials: int) -> float:
-    seed_tensor = args[-1]
+def _run_eager(
+    args: list[object],
+    seed_tensor: torch.Tensor,
+    draft_token: int,
+    n_trials: int,
+) -> float:
     accepted = 0
     for s in range(n_trials):
         seed_tensor.fill_(s)
@@ -113,11 +117,11 @@ def _run_eager(args: list[object], draft_token: int, n_trials: int) -> float:
 
 def _run_graph(
     args: list[object],
+    seed_tensor: torch.Tensor,
     draft_token: int,
     n_trials: int,
     mode: str,
 ) -> float:
-    seed_tensor = args[-1]
     graph = torch.npu.NPUGraph()
     stream = torch.npu.Stream()
     with torch.npu.graph(graph, stream=stream, capture_error_mode=mode):
@@ -176,15 +180,17 @@ def main() -> None:
             draft_logits0 = torch.zeros(VOCAB, device=device)
             draft_logits0[draft_token] = _logit_for_prob(draft_prob)
 
-        args, _ = _build_inputs(draft_token, target_logits0, draft_logits0)
+        args, seed_tensor = _build_inputs(draft_token, target_logits0, draft_logits0)
         expected = _expected_acceptance(draft_token, target_logits0, draft_logits0)
 
-        observed_eager = _run_eager(args, draft_token, N_TRIALS)
+        observed_eager = _run_eager(args, seed_tensor, draft_token, N_TRIALS)
         all_ok &= _check(name, "eager", observed_eager, expected)
 
         for mode in ("global", "relaxed"):
             try:
-                observed_graph = _run_graph(args, draft_token, N_TRIALS, mode)
+                observed_graph = _run_graph(
+                    args, seed_tensor, draft_token, N_TRIALS, mode
+                )
                 all_ok &= _check(name, f"graph[{mode}]", observed_graph, expected)
             except Exception as exc:  # noqa: BLE001
                 print(
