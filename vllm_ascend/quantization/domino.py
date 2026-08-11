@@ -43,6 +43,15 @@ def _fused_kv_force_per_layer() -> bool:
     ).strip().lower() in ("0", "false", "no", "off")
 
 
+def _fused_qkv_disabled() -> bool:
+    """``VLLM_ASCEND_DOMINO_FUSED_QKV=0`` keeps the separate q/k/v
+    projections (the bf16 fused projection is slower on NPU; only the
+    quantized fused projection wins)."""
+    return os.environ.get(
+        "VLLM_ASCEND_DOMINO_FUSED_QKV", "1"
+    ).strip().lower() in ("0", "false", "no", "off")
+
+
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
     return torch.floor(x + torch.rand_like(x))
 
@@ -297,7 +306,11 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
 
     count = 0
     model._fused_kv_scheme = None
+    model._use_fused_qkv = False
     kv_target_pending: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+    qkv_pending: dict[
+        int, dict[str, tuple[torch.Tensor, torch.Tensor, str]]
+    ] = {}
     for path, module in model.named_modules():
         if not isinstance(module, LinearBase):
             continue
@@ -310,12 +323,14 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             )
             _quantize_w4a4(module, w_int, scale)
             scheme = "W4A4"
+            _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w4a4")
         elif qat_w_bit == 4:
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
             )
             _quantize_w4a8(module, w_int, scale)
             scheme = "W4A8"
+            _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w4a8")
             if path.endswith(".k_proj_target") or path.endswith(
                 ".v_proj_target"
             ):
@@ -380,7 +395,69 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             flush=True,
         )
 
+    # Build the fused draft q/k/v projection buffers (single-pack of the
+    # concatenated q+k+v int4 matrix), one per layer, following each layer's
+    # scheme (layer 0 is W4A4 in the current config, the rest W4A8).
+    if not _fused_qkv_disabled() and len(qkv_pending) == num_layers and all(
+        len(pair) == 3 for pair in qkv_pending.values()
+    ):
+        fused_qkv_weights = []
+        fused_qkv_scales = []
+        fused_qkv_schemes = []
+        for i in range(num_layers):
+            w_int_q, scale_q, scheme = qkv_pending[i]["q"]
+            w_int_k, scale_k, _ = qkv_pending[i]["k"]
+            w_int_v, scale_v, _ = qkv_pending[i]["v"]
+            fused_int = torch.cat(
+                [w_int_q, w_int_k, w_int_v], dim=0
+            )
+            fused_scale = torch.cat([scale_q, scale_k, scale_v])
+            if scheme == "w4a8":
+                packed = torch_npu.npu_convert_weight_to_int4pack(
+                    fused_int.to(torch.int32).t().contiguous()
+                )
+                packed = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
+                fused_scale = fused_scale.reshape(-1).to(torch.bfloat16)
+            else:
+                packed = torch_npu.npu_convert_weight_to_int4pack(
+                    fused_int.to(torch.int32).contiguous()
+                ).transpose(-1, -2)
+                fused_scale = fused_scale.reshape(-1)
+            fused_qkv_weights.append(packed)
+            fused_qkv_scales.append(fused_scale)
+            fused_qkv_schemes.append(scheme)
+        model._fused_qkv_scheme = fused_qkv_schemes
+        model._fused_qkv_weight = fused_qkv_weights
+        model._fused_qkv_scale = fused_qkv_scales
+        model._use_fused_qkv = True
+        print(
+            f"[DominoQuant] fused draft qkv buffers built for "
+            f"{num_layers} layers "
+            f"(schemes={fused_qkv_schemes})",
+            flush=True,
+        )
+
     return count
+
+
+def _maybe_record_draft_qkv(
+    pending: dict,
+    path: str,
+    w_int: torch.Tensor,
+    scale: torch.Tensor,
+    scheme: str,
+) -> None:
+    """Record a draft q/k/v projection (not ``k_proj_target``/``v_proj_target``)
+    for fused qkv buffer construction."""
+    if not (
+        path.endswith(".q_proj")
+        or path.endswith(".k_proj")
+        or path.endswith(".v_proj")
+    ):
+        return
+    layer_idx = int(path.split(".")[1])
+    key = path.rsplit(".", 1)[-1][0]  # "q" / "k" / "v"
+    pending.setdefault(layer_idx, {})[key] = (w_int, scale, scheme)
 
 
 def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
@@ -431,4 +508,27 @@ def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
     )
     model._use_fused_context_kv = True
     model._fused_kv_quantized = True
+    return True
+
+
+def build_quantized_fused_qkv(model: torch.nn.Module) -> bool:
+    """Attach the fused draft q/k/v buffers to each attention layer.
+
+    Only the quantized path uses the fused projection (probe: fused bf16 is
+    slower on NPU, fused W4A8/W4A4 is faster).  The per-layer buffers built by
+    :func:`quantize_domino_model` are copied onto each ``self_attn`` module so
+    the patched attention forward can read them during the draft forward.
+    """
+    if (
+        _fused_qkv_disabled()
+        or not getattr(model, "_use_fused_qkv", False)
+    ):
+        return False
+    for i, attn in enumerate(
+        layer.self_attn for layer in model.layers
+    ):
+        attn._fused_qkv_scheme = model._fused_qkv_scheme[i]
+        attn._fused_qkv_weight = model._fused_qkv_weight[i]
+        attn._fused_qkv_scale = model._fused_qkv_scale[i]
+        attn._use_fused_qkv = True
     return True

@@ -27,7 +27,64 @@ import time
 import torch
 import torch_npu
 
+from vllm.model_executor.models.qwen3_domino import DominoQwen3Attention
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
+
+
+def _ascend_domino_attention_forward(
+    self: DominoQwen3Attention,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Domino attention forward with the optional fused quantized qkv.
+
+    The fused path is attached by ``build_quantized_fused_qkv`` after
+    on-the-fly quantization (W4A8 single-pack or W4A4 packed q+k+v, one
+    projection call per layer).  The bf16 path keeps the separate q/k/v
+    linears, since a fused bf16 projection is slower on NPU.
+    """
+    if getattr(self, "_use_fused_qkv", False):
+        scheme = self._fused_qkv_scheme
+        if scheme == "w4a8":
+            qkv = torch_npu.npu_weight_quant_batchmatmul(
+                hidden_states,
+                self._fused_qkv_weight,
+                antiquant_scale=self._fused_qkv_scale,
+                antiquant_group_size=0,
+            )
+        elif scheme == "w4a4":
+            x4, x4s = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.quint4x2
+            )
+            qkv = torch_npu.npu_quant_matmul(
+                x4,
+                self._fused_qkv_weight,
+                scale=self._fused_qkv_scale.view(-1),
+                pertoken_scale=x4s.reshape(-1),
+                bias=None,
+                output_dtype=torch.float16,
+            ).to(hidden_states.dtype)
+        else:
+            raise RuntimeError(f"unknown fused qkv scheme: {scheme}")
+        q, k, v = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+    else:
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+    q_shape, k_shape = q.shape, k.shape
+    q = self.q_norm(
+        q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
+    ).view(q_shape)
+    k = self.k_norm(
+        k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
+    ).view(k_shape)
+
+    q, k = self.rotary_emb(positions, q, k)
+    attn_output = self.attn(q, k, v)
+    return self.o_proj(attn_output)
 
 
 def precompute_and_store_context_kv(
@@ -175,3 +232,4 @@ def precompute_and_store_context_kv(
 Qwen3DominoModel.precompute_and_store_context_kv = (
     precompute_and_store_context_kv
 )
+DominoQwen3Attention.forward = _ascend_domino_attention_forward

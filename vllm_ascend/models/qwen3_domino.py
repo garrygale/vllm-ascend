@@ -16,6 +16,7 @@ from vllm_ascend.ops.triton.spec_decode.domino_gru import (
 )
 from vllm_ascend.quantization.domino import (
     build_quantized_fused_kv_buffers,
+    build_quantized_fused_qkv,
     quantize_domino_model,
 )
 
@@ -86,6 +87,12 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                     print(
                         "[AscendDomino] quantized fused context-KV "
                         "precompute enabled (W4A8)",
+                        flush=True,
+                    )
+                if build_quantized_fused_qkv(self.model):
+                    print(
+                        "[AscendDomino] fused draft qkv projections enabled "
+                        "(quantized)",
                         flush=True,
                     )
 
