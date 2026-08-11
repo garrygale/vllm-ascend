@@ -40,8 +40,11 @@ def _ascend_domino_attention_forward(
 
     The fused path is attached by ``build_quantized_fused_qkv`` after
     on-the-fly quantization (W4A8 single-pack or W4A4 packed q+k+v, one
-    projection call per layer).  The bf16 path keeps the separate q/k/v
-    linears, since a fused bf16 projection is slower on NPU.
+    projection call per layer).  The fused projection also feeds
+    ``qkv_rmsnorm_rope``, which applies q/k RMSNorm + RoPE in one kernel
+    (probe: ~2x faster than split + two norms + rope).  The bf16 path keeps
+    the separate q/k/v linears, since a fused bf16 projection is slower on
+    NPU.
     """
     if getattr(self, "_use_fused_qkv", False):
         scheme = self._fused_qkv_scheme
@@ -66,23 +69,41 @@ def _ascend_domino_attention_forward(
             ).to(hidden_states.dtype)
         else:
             raise RuntimeError(f"unknown fused qkv scheme: {scheme}")
-        q, k, v = qkv.split(
-            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        q, k, v = torch.ops.vllm.qkv_rmsnorm_rope(
+            input=qkv,
+            cos_sin_cache=self._fused_qkv_cos_sin_cache,
+            positions=positions,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            q_hidden_size=self.q_size,
+            kv_hidden_size=self.kv_size,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_bias=None,
+            k_bias=None,
         )
     else:
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-    q_shape, k_shape = q.shape, k.shape
-    q = self.q_norm(
-        q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
-    ).view(q_shape)
-    k = self.k_norm(
-        k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
-    ).view(k_shape)
+        q_shape, k_shape = q.shape, k.shape
+        q = self.q_norm(
+            q.view(
+                *q_shape[:-1],
+                q_shape[-1] // self.head_dim,
+                self.head_dim,
+            )
+        ).view(q_shape)
+        k = self.k_norm(
+            k.view(
+                *k_shape[:-1],
+                k_shape[-1] // self.head_dim,
+                self.head_dim,
+            )
+        ).view(k_shape)
 
-    q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
     attn_output = self.attn(q, k, v)
     return self.o_proj(attn_output)
 

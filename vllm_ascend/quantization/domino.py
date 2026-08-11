@@ -530,5 +530,10 @@ def build_quantized_fused_qkv(model: torch.nn.Module) -> bool:
         attn._fused_qkv_scheme = model._fused_qkv_scheme[i]
         attn._fused_qkv_weight = model._fused_qkv_weight[i]
         attn._fused_qkv_scale = model._fused_qkv_scale[i]
+        # The fused split+q/k-rmsnorm+rope Triton kernel expects a bf16
+        # cos/sin cache; keep a bf16 copy (no-op when it already is bf16).
+        attn._fused_qkv_cos_sin_cache = (
+            attn.rotary_emb.cos_sin_cache.to(torch.bfloat16).contiguous()
+        )
         attn._use_fused_qkv = True
     return True
