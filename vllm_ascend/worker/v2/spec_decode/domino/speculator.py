@@ -31,6 +31,20 @@ class AscendDominoSpeculator(DominoSpeculator):
         if self.query_cudagraph_manager is not None:
             self.query_cudagraph_manager.speculator = self
 
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        model = super().load_draft_model(
+            target_model, target_attn_layer_names
+        )
+        # Build the triton-table eagerly now that embed/lm_head sharing is
+        # done, so the one-time TP all-gather (TP>1) never runs inside ACL
+        # graph capture.  ``_ensure_domino_triton_gru`` stays idempotent.
+        model._ensure_domino_triton_gru()
+        return model
+
     def set_attn(
         self,
         model_state: Any,

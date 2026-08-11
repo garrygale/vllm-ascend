@@ -7,6 +7,10 @@ from collections.abc import Iterable
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
@@ -46,8 +50,8 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         self._domino_gi_table = None
         self._validate_domino_triton_gru()
         print(
-            "[AscendDomino] Domino triton GRU is the default path; tables "
-            "will build lazily on first use",
+            "[AscendDomino] Domino triton GRU is the default path; the "
+            "gi_table is built after weight sharing",
             flush=True,
         )
 
@@ -89,7 +93,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             self.model._build_fused_kv_buffers()
 
     def _validate_domino_triton_gru(self) -> None:
-        """Validate the triton-table path; tables build lazily.
+        """Validate the triton-table path.
 
         Requires the ``embed_proj`` (no ``hidden_proj``) config.
         """
@@ -103,13 +107,14 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         )
 
     def _ensure_domino_triton_gru(self) -> None:
-        """Lazily precompute the triton-table cell + fused-h tensors.
+        """Precompute the triton-table cell + fused-h tensors.
 
-        Built on first use (not in ``load_weights``) because the draft
-        ``embed_tokens`` is replaced by the target's shared embedding *after*
-        weight loading; ``gi_table`` must come from the final shared table.
+        Called eagerly by ``AscendDominoSpeculator.load_draft_model`` after
+        the draft ``embed_tokens`` is replaced by the target's shared
+        embedding; the idempotent guard also covers any later first use.
           * ``gi_table = emb_weight @ W_ih^T`` (replaces the per-step x matmul
-            with a gather),
+            with a gather); with TP>1 the per-rank shard is all-gathered into
+            the full padded-vocab table so per-step gathers stay local,
           * ``W_sh = cat([W_s, W_hh], dim=0)`` (one h projection shared by the
             correction head and the GRU cell).
         """
@@ -126,7 +131,15 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             fc1_w = self.model.embed_proj[0].weight.detach()  # [M, H+G]
             emb_w = self.model.embed_tokens.weight.detach()  # [V, H]
 
-            self._domino_gi_table = F.linear(emb_w, w_ih).contiguous()
+            gi_local = F.linear(emb_w, w_ih).contiguous()
+            if get_tensor_model_parallel_world_size() > 1:
+                # Local vocab shards are contiguous slices of the padded
+                # vocab, so gathering in rank order reconstructs the full
+                # table; per-step gathers then stay local and collective-free.
+                gi_full = tensor_model_parallel_all_gather(gi_local, dim=0)
+            else:
+                gi_full = gi_local
+            self._domino_gi_table = gi_full.contiguous()
             self._domino_w_z = fc1_w[:, :H].contiguous()
             w_s = fc1_w[:, H:].contiguous()
             self._domino_w_sh = torch.cat([w_s, w_hh], dim=0).contiguous()
@@ -138,7 +151,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         )
         print(
             f"[AscendDomino] Domino triton GRU enabled "
-            f"(gi_table {mb:.0f} MB, TP=1)",
+            f"(gi_table {mb:.0f} MB)",
             flush=True,
         )
 
