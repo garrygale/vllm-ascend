@@ -390,7 +390,9 @@ def main() -> None:
 
     print("-" * 60)
     print("timing (ms per call, eager vs graph replay):")
-    timing_ts = (8, 64, 256)
+    # Precompute runs per step with num_target_tokens context tokens: the
+    # decode batch size (small, e.g. 1-32) or the prompt length at prefill.
+    timing_ts = (1, 4, 8, 16, 64, 256)
     timing_iters = 20
     timing_warmup = 5
     for t_size in timing_ts:
