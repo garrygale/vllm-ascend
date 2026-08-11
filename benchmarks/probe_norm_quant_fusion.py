@@ -18,7 +18,7 @@ This probe validates the two fused ops that collapse those chains:
   * ``torch.ops.npu.npu_add_rms_norm_dynamic_quant`` (residual + RMSNorm +
     int8 dynamic quant in one call; output[0]=x8, output[2]=residual,
     output[3]=per-token scale, per the vllm-ascend fusion pass),
-  * ``torch.ops._C_ascend.npu_rms_norm_dynamic_quant`` (RMSNorm + int8
+  * ``npu_rms_norm_dynamic_quant`` (RMSNorm + int8
     dynamic quant; returns ``(x8, per-token scale)``, used in dsa_v1).
 
 Checks:
@@ -38,6 +38,13 @@ import time
 
 import torch
 import torch_npu
+
+# The non-add RMSNorm+quant op is registered by vllm-ascend's compiled
+# extension (``torch.ops._C_ascend``); the standalone probe must load it.
+try:
+    import vllm_ascend.vllm_ascend_C  # noqa: F401
+except Exception as exc:  # noqa: BLE001
+    print(f"WARNING: vllm_ascend.vllm_ascend_C import failed: {exc}")
 
 EPS = 1e-6
 
@@ -72,6 +79,31 @@ def _rms_norm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
 def _squeeze_scale(s: torch.Tensor) -> torch.Tensor:
     return s.squeeze(-1) if s.dim() == 2 else s
+
+
+def _resolve_rnq_op():
+    """Return the first available RMSNorm+dynamic-quant op."""
+    _c_ascend = getattr(torch.ops, "_C_ascend", None)
+    npu_ns = getattr(torch.ops, "npu", None)
+    candidates = []
+    if _c_ascend is not None:
+        candidates.append((_c_ascend, "npu_rms_norm_dynamic_quant"))
+    if npu_ns is not None:
+        candidates.append((npu_ns, "npu_rms_norm_dynamic_quant"))
+    candidates.append((torch_npu, "npu_rms_norm_dynamic_quant"))
+    for mod, name in candidates:
+        if hasattr(mod, name):
+            return getattr(mod, name)
+    return None
+
+
+_RNQ_OP = _resolve_rnq_op()
+
+
+def _rms_norm_dynamic_quant(x: torch.Tensor, w: torch.Tensor, eps: float):
+    if _RNQ_OP is None:
+        raise RuntimeError("npu_rms_norm_dynamic_quant is unavailable")
+    return _RNQ_OP(x, w, epsilon=eps)
 
 
 def _quant_ref(x: torch.Tensor):
@@ -126,10 +158,16 @@ def main() -> None:
     device = "npu"
     torch.manual_seed(0)
 
-    has_add = hasattr(torch.ops.npu, "npu_add_rms_norm_dynamic_quant")
-    has_rnq = hasattr(torch.ops._C_ascend, "npu_rms_norm_dynamic_quant")
+    npu_ns = getattr(torch.ops, "npu", None)
+    has_add = npu_ns is not None and hasattr(
+        npu_ns, "npu_add_rms_norm_dynamic_quant"
+    )
+    has_rnq = _RNQ_OP is not None
     print(f"npu_add_rms_norm_dynamic_quant: {has_add}")
-    print(f"npu_rms_norm_dynamic_quant: {has_rnq}")
+    print(
+        f"npu_rms_norm_dynamic_quant: {has_rnq} "
+        f"(op={getattr(_RNQ_OP, '__qualname__', _RNQ_OP)})"
+    )
     if not (has_add and has_rnq):
         print("missing fused ops; aborting", flush=True)
         return
@@ -145,9 +183,7 @@ def main() -> None:
 
     # --- RMSNorm + dynamic quant (context-KV style, no residual) ---
     x8_ref, x8s_ref = _quant_ref(_rms_norm_ref(x, w_norm, EPS))
-    x8_f, x8s_f = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-        x, w_norm, epsilon=EPS
-    )
+    x8_f, x8s_f = _rms_norm_dynamic_quant(x, w_norm, EPS)
     x8s_f = _squeeze_scale(x8s_f)
     all_ok &= _diag_x8(
         "rms_norm_dynamic_quant", x8_f, x8_ref, x8s_f, x8s_ref
@@ -247,9 +283,7 @@ def main() -> None:
     )
     x8_ref, x8s_ref = _quant_ref(_rms_norm_ref(x_ctx, w_hn, EPS))
     out_ref = _ctx_grouped(x_ctx, group_list, x8_ref, x8s_ref)
-    x8_f, x8s_f = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-        x_ctx, w_hn, epsilon=EPS
-    )
+    x8_f, x8s_f = _rms_norm_dynamic_quant(x_ctx, w_hn, EPS)
     out_f = _ctx_grouped(x_ctx, group_list, x8_f, x8s_f)
     err_ctx = (out_f.float() - out_ref.float()).abs().max().item()
     all_ok &= _diag_x8(
@@ -268,9 +302,7 @@ def main() -> None:
         (
             "rms_norm_dynamic_quant",
             lambda: (x,),
-            lambda x_in: torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                x_in, w_norm, epsilon=EPS
-            ),
+            lambda x_in: _rms_norm_dynamic_quant(x_in, w_norm, EPS),
         ),
         (
             "add_rms_norm_dynamic_quant",
@@ -294,9 +326,7 @@ def main() -> None:
             lambda x_in: _ctx_grouped(
                 x_in,
                 group_list,
-                *torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                    x_in, w_hn, epsilon=EPS
-                ),
+                *_rms_norm_dynamic_quant(x_in, w_hn, EPS),
             ),
         ),
     ]
@@ -398,9 +428,7 @@ def main() -> None:
                 lambda: _ctx_grouped(
                     x_t,
                     group_list_t,
-                    *torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                        x_t, w_hn, epsilon=EPS
-                    ),
+                    *_rms_norm_dynamic_quant(x_t, w_hn, EPS),
                 ),
             ),
         ]
