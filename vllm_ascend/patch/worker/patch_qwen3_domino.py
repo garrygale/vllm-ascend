@@ -9,6 +9,11 @@ The vLLM main implementation uses ``ops.rms_norm`` and
 module-based RMSNorm, a per-layer k-norm loop, and the Ascend rotary module
 with a cloned key, mirroring ``patch_qwen3_dflash.py``.
 
+With on-the-fly W4A8 quantization, the fused K/V projection is one
+``npu_grouped_matmul`` call over the per-layer packed int4 weights (3D weight
+``[D, K, 2N//8]``, per-layer scales/offsets, ``split_item=2``); the packed
+K+V weights are built as a single pack by ``quantize_domino_model``.
+
 Temporary debug env vars:
   * ``VLLM_ASCEND_DOMINO_TIMING=1`` prints each precompute's wall time in us
     (with NPU sync, so it reflects device execution).
@@ -20,6 +25,7 @@ import os
 import time
 
 import torch
+import torch_npu
 
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
 
@@ -63,19 +69,46 @@ def precompute_and_store_context_kv(
         hd = self._head_dim
         nkv = self._num_kv_heads
 
-        # --- Fused KV projection (one batched GEMM for all layers) ---
-        # All layers share the same hidden_norm, so the [T, D, H] context is
-        # flattened to [T*D, H], normalized in one module call, then projected
-        # through the per-layer K/V weights with one bmm.
-        normed_context_states = self.hidden_norm(
-            context_states.reshape(num_ctx * D, H)
-        )
-        fused = normed_context_states.view(num_ctx, D, H)
-        all_kv_flat = torch.bmm(
-            fused.permute(1, 0, 2).contiguous(), self._fused_kv_weight_T
-        )
-        if self._fused_kv_bias is not None:
-            all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
+        if getattr(self, "_fused_kv_quantized", False):
+            # --- Quantized fused KV projection (one grouped W4A8 GEMM) ---
+            # All layers share the same hidden_norm; the [T, D, H] context is
+            # flattened to [T*D, H], normalized in one module call, then
+            # projected through the per-layer packed int4 K/V weights with a
+            # single npu_grouped_matmul (3D weight + group_list, split_item=2).
+            normed_context_states = self.hidden_norm(
+                context_states.reshape(num_ctx * D, H)
+            )
+            fused = (
+                normed_context_states.view(num_ctx, D, H)
+                .permute(1, 0, 2)
+                .reshape(D * num_ctx, H)
+                .contiguous()
+            )
+            group_list = self._fused_kv_group_list
+            group_list.fill_(num_ctx)
+            group_list.cumsum_(0)
+            all_kv_flat = torch_npu.npu_grouped_matmul(
+                x=[fused],
+                weight=[self._fused_kv_weight],
+                antiquant_scale=[self._fused_kv_scale],
+                antiquant_offset=[self._fused_kv_offset],
+                group_list=group_list,
+                split_item=2,
+                group_type=0,
+                group_list_type=0,
+                output_dtype=torch.bfloat16,
+            )[0].contiguous()
+        else:
+            # --- bf16 fused KV projection (one batched GEMM for all layers) ---
+            normed_context_states = self.hidden_norm(
+                context_states.reshape(num_ctx * D, H)
+            )
+            fused = normed_context_states.view(num_ctx, D, H)
+            all_kv_flat = torch.bmm(
+                fused.permute(1, 0, 2).contiguous(), self._fused_kv_weight_T
+            )
+            if self._fused_kv_bias is not None:
+                all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
         # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
         all_kv = all_kv_flat.view(D, num_ctx, 2, nkv, hd)
         all_k = all_kv[:, :, 0]
@@ -126,7 +159,11 @@ def precompute_and_store_context_kv(
                 "per-layer"
                 if force_per_layer
                 or not getattr(self, "_use_fused_context_kv", False)
-                else "fused"
+                else (
+                    "fused-w4a8"
+                    if getattr(self, "_fused_kv_quantized", False)
+                    else "fused"
+                )
             )
             elapsed_us = (time.perf_counter() - t0) * 1e6
             print(

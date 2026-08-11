@@ -14,7 +14,10 @@ from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton,
 )
-from vllm_ascend.quantization.domino import quantize_domino_model
+from vllm_ascend.quantization.domino import (
+    build_quantized_fused_kv_buffers,
+    quantize_domino_model,
+)
 
 
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
@@ -63,6 +66,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         # W4A8 (npu_weight_quant_batchmatmul, int4-packed int32) works in both
         # eager and ACL graph mode, so no eager/graph redirect is needed.
         quant_env = os.environ.get("VLLM_ASCEND_DOMINO_QUANT", "").strip().lower()
+        quant_fused = False
         if quant_env in ("0", "false", "no", "off"):
             print(
                 "[AscendDomino] Domino quantization disabled by "
@@ -77,12 +81,19 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                     f"{num_quantized} draft linears",
                     flush=True,
                 )
+                quant_fused = build_quantized_fused_kv_buffers(self.model)
+                if quant_fused:
+                    print(
+                        "[AscendDomino] quantized fused context-KV "
+                        "precompute enabled (W4A8)",
+                        flush=True,
+                    )
 
-        # Rebuild the fused context-KV buffers: after quantization the K/V
-        # weights are no longer floating point, so this disables the fused
-        # path and frees the bf16 buffers (per-layer quantized projections
-        # are used instead).
-        self.model._build_fused_kv_buffers()
+        if not quant_fused:
+            # bf16 path (quantization disabled) or unsupported quantized
+            # K/V scheme: rebuild the bf16 fused buffers or fall back to the
+            # per-layer quantized projections.
+            self.model._build_fused_kv_buffers()
 
     def _validate_domino_triton_gru(self) -> None:
         """Check the triton-table path is usable; tables build lazily.

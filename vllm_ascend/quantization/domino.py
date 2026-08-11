@@ -30,6 +30,8 @@ import torch_npu
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 
+ACL_FORMAT_ND = 2
+
 
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
     return torch.floor(x + torch.rand_like(x))
@@ -284,6 +286,8 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     )
 
     count = 0
+    model._fused_kv_scheme = None
+    kv_target_pending: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
     for path, module in model.named_modules():
         if not isinstance(module, LinearBase):
             continue
@@ -302,6 +306,15 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             )
             _quantize_w4a8(module, w_int, scale)
             scheme = "W4A8"
+            if path.endswith(".k_proj_target") or path.endswith(
+                ".v_proj_target"
+            ):
+                layer_idx = int(path.split(".")[1])
+                key = "k" if path.endswith(".k_proj_target") else "v"
+                kv_target_pending.setdefault(layer_idx, {})[key] = (
+                    w_int,
+                    scale,
+                )
         else:
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 8, stochastic
@@ -316,4 +329,92 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             flush=True,
         )
 
+    # Build the fused context-KV W4A8 buffers (single-pack of the concatenated
+    # K+V int4 matrix).  Concatenating two separately-packed tensors is NOT
+    # valid on this CANN, so this must happen here while the unpacked int4
+    # values are still available.
+    num_layers = model.config.num_hidden_layers
+    if (
+        len(kv_target_pending) == num_layers
+        and all(
+            len(pair) == 2 for pair in kv_target_pending.values()
+        )
+    ):
+        fused_weights = []
+        fused_scales = []
+        for i in range(num_layers):
+            w_int_k, scale_k = kv_target_pending[i]["k"]
+            w_int_v, scale_v = kv_target_pending[i]["v"]
+            fused_int = (
+                torch.cat([w_int_k, w_int_v], dim=0)
+                .to(torch.int32)
+                .t()
+                .contiguous()
+            )
+            packed = torch_npu.npu_convert_weight_to_int4pack(fused_int)
+            packed_nd = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
+            fused_weights.append(packed_nd)
+            fused_scales.append(
+                torch.cat([scale_k, scale_v])
+                .reshape(-1)
+                .to(torch.bfloat16)
+            )
+        model._fused_kv_weight = torch.stack(fused_weights, dim=0)
+        model._fused_kv_scale = torch.stack(fused_scales, dim=0)
+        model._fused_kv_offset = torch.zeros_like(model._fused_kv_scale)
+        model._fused_kv_scheme = "w4a8"
+        print(
+            f"[DominoQuant] fused context-KV buffers built for "
+            f"{num_layers} layers (W4A8 single-pack)",
+            flush=True,
+        )
+
     return count
+
+
+def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
+    """Enable the quantized fused context-KV path on the Domino draft model.
+
+    Consumes the fused W4A8 buffers built by :func:`quantize_domino_model`
+    (``_fused_kv_weight/_scale/_offset``) and fills in the same metadata the
+    bf16 fused path uses (hidden-norm, k-norm, RoPE, attn layers, kv dims).
+    The per-step ``group_list`` buffer is preallocated and updated in place
+    (``fill_(T)`` + ``cumsum_(0)``), so no per-call allocation is needed.
+
+    Returns True when the fused quantized path is active; otherwise the
+    per-layer fallback remains in use.
+    """
+    if getattr(model, "_fused_kv_scheme", None) != "w4a8":
+        model._use_fused_context_kv = False
+        return False
+
+    layers_attn = [layer.self_attn for layer in model.layers]
+    attn0 = layers_attn[0]
+
+    # Free the bf16 fused buffers built by the base load_weights path.
+    for attr in ("_fused_kv_weight_T", "_fused_kv_bias"):
+        if hasattr(model, attr):
+            delattr(model, attr)
+
+    model._hidden_norm_weight = model.hidden_norm.weight.data
+    model._hidden_norm_eps = model.hidden_norm.variance_epsilon
+    model._k_norm_weights = torch.stack(
+        [attn.k_norm.weight.data for attn in layers_attn], dim=0
+    ).contiguous()
+    model._rope_head_size = attn0.rotary_emb.head_size
+    model._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
+    model._rope_is_neox = attn0.rotary_emb.is_neox_style
+    model._num_attn_layers = len(layers_attn)
+    model._kv_size = attn0.kv_size
+    model._head_dim = attn0.head_dim
+    model._num_kv_heads = attn0.num_kv_heads
+    model._rms_norm_eps = attn0.k_norm.variance_epsilon
+    model._attn_layers = [layer.self_attn.attn for layer in model.layers]
+    model._fused_kv_group_list = torch.empty(
+        model._num_attn_layers,
+        dtype=torch.int64,
+        device=model._fused_kv_weight.device,
+    )
+    model._use_fused_context_kv = True
+    model._fused_kv_quantized = True
+    return True
