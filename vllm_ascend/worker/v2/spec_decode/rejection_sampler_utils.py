@@ -242,7 +242,7 @@ def _probabilistic_rejection_kernel(
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_tokens = end_idx - start_idx
-    seed = tl.load(seed_ptr + req_state_idx)  # noqa: F841
+    seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
 
     rejected_step = 0
@@ -284,8 +284,14 @@ def _probabilistic_rejection_kernel(
                     PADDED_VOCAB_NUM_BLOCKS,
                 )
                 target_log_prob = target_logit - target_lse
-                # NPU does not support tl_rand64; always accept the draft token.
-                u = tl.full([], 0.0, dtype=tl.float32)
+                # Draw a uniform u in (0, 1) with the same (seed, pos) key as
+                # vLLM's tl_rand32(..., includes_zero=False). NPU Triton's
+                # tl.rand takes a block offset, so use a size-1 block and
+                # reduce it to a scalar. Clamp zero draws to the smallest
+                # positive fp32 uniform (2**-31) so log(u) stays finite.
+                pos = tl.load(pos_ptr + logit_idx).to(tl.int32)
+                u = tl.max(tl.rand(seed, pos + tl.arange(0, 1)), axis=0)
+                u = tl.maximum(u, 4.6566127342e-10)
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
