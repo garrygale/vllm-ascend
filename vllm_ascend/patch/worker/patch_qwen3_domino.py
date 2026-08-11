@@ -30,6 +30,15 @@ import torch_npu
 from vllm.model_executor.models.qwen3_domino import DominoQwen3Attention
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
 
+try:
+    from vllm_ascend.ops.triton.spec_decode.domino_kv_utils import (
+        domino_grouped_k_norm,
+        fused_kv_cache_write,
+    )
+except Exception:  # noqa: BLE001  (triton unavailable)
+    domino_grouped_k_norm = None
+    fused_kv_cache_write = None
+
 
 def _ascend_domino_attention_forward(
     self: DominoQwen3Attention,
@@ -192,11 +201,19 @@ def precompute_and_store_context_kv(
         all_k = all_kv[:, :, 0]
         all_v = all_kv[:, :, 1]
 
-        # --- Per-layer RMSNorm K ([D, T, nkv, hd]) ---
-        all_k_normed = torch.empty_like(all_k)
-        for i in range(D):
-            k_norm_layer = self.layers[i].self_attn.k_norm
-            all_k_normed[i] = k_norm_layer(all_k[i])
+        # --- Grouped RMSNorm K ([D, T, nkv, hd]) ---
+        if (
+            domino_grouped_k_norm is not None
+            and hasattr(self, "_k_norm_weights")
+        ):
+            all_k_normed = domino_grouped_k_norm(
+                all_k, self._k_norm_weights, self._rms_norm_eps
+            )
+        else:
+            all_k_normed = torch.empty_like(all_k)
+            for i in range(D):
+                k_norm_layer = self.layers[i].self_attn.k_norm
+                all_k_normed[i] = k_norm_layer(all_k[i])
 
         # --- Fused RoPE across all layers ---
         # Ascend's rotary op requires a real key tensor (it does not accept
@@ -212,24 +229,48 @@ def precompute_and_store_context_kv(
         if context_slot_mapping is None:
             return
 
-        # --- Per-layer cache insert ---
+        # --- Cache insert (fused multi-layer write, per-layer fallback) ---
         all_k_final = all_k_flat.view(D, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        for i in range(D):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
+        fused_ok = False
+        if fused_kv_cache_write is not None and D == 7:
+            slots_list = (
+                list(context_slot_mapping)
+                if per_layer
+                else [context_slot_mapping] * D
             )
-            if slot_mapping is None:
-                continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
-            kv_cache = attn.kv_cache
-            attn.impl.do_kv_cache_update(
-                attn,
-                all_k_final[i],
-                all_v[i],
-                kv_cache,
-                slot_mapping,
-            )
+            if all(s is not None for s in slots_list):
+                kv_caches = [
+                    self._attn_layers[i].kv_cache for i in range(D)
+                ]
+                if all(
+                    c is not None and len(c) >= 2 for c in kv_caches
+                ):
+                    fused_ok = fused_kv_cache_write(
+                        all_k_final,
+                        all_v,
+                        [c[0] for c in kv_caches],
+                        [c[1] for c in kv_caches],
+                        slots_list,
+                    )
+        if not fused_ok:
+            for i in range(D):
+                slot_mapping = (
+                    context_slot_mapping[i]
+                    if per_layer
+                    else context_slot_mapping
+                )
+                if slot_mapping is None:
+                    continue  # dummy run: skip cache ops
+                attn = self._attn_layers[i]
+                kv_cache = attn.kv_cache
+                attn.impl.do_kv_cache_update(
+                    attn,
+                    all_k_final[i],
+                    all_v[i],
+                    kv_cache,
+                    slot_mapping,
+                )
     finally:
         if timing:
             torch.npu.synchronize()
