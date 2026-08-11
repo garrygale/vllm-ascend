@@ -33,11 +33,9 @@ from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
 try:
     from vllm_ascend.ops.triton.spec_decode.domino_kv_utils import (
         domino_grouped_k_norm,
-        fused_kv_cache_write,
     )
 except Exception:  # noqa: BLE001  (triton unavailable)
     domino_grouped_k_norm = None
-    fused_kv_cache_write = None
 
 
 def _ascend_domino_attention_forward(
@@ -229,55 +227,26 @@ def precompute_and_store_context_kv(
         if context_slot_mapping is None:
             return
 
-        # --- Cache insert (fused multi-layer write, per-layer fallback) ---
+        # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(D, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        fused_ok = False
-        fused_write_env = os.environ.get(
-            "VLLM_ASCEND_DOMINO_FUSED_KV_WRITE", "0"
-        ).strip().lower()
-        if (
-            fused_write_env in ("1", "true", "yes", "on")
-            and fused_kv_cache_write is not None
-            and D == 7
-        ):
-            slots_list = (
-                list(context_slot_mapping)
+        for i in range(D):
+            slot_mapping = (
+                context_slot_mapping[i]
                 if per_layer
-                else [context_slot_mapping] * D
+                else context_slot_mapping
             )
-            if all(s is not None for s in slots_list):
-                kv_caches = [
-                    self._attn_layers[i].kv_cache for i in range(D)
-                ]
-                if all(
-                    c is not None and len(c) >= 2 for c in kv_caches
-                ):
-                    fused_ok = fused_kv_cache_write(
-                        all_k_final,
-                        all_v,
-                        [c[0] for c in kv_caches],
-                        [c[1] for c in kv_caches],
-                        slots_list,
-                    )
-        if not fused_ok:
-            for i in range(D):
-                slot_mapping = (
-                    context_slot_mapping[i]
-                    if per_layer
-                    else context_slot_mapping
-                )
-                if slot_mapping is None:
-                    continue  # dummy run: skip cache ops
-                attn = self._attn_layers[i]
-                kv_cache = attn.kv_cache
-                attn.impl.do_kv_cache_update(
-                    attn,
-                    all_k_final[i],
-                    all_v[i],
-                    kv_cache,
-                    slot_mapping,
-                )
+            if slot_mapping is None:
+                continue  # dummy run: skip cache ops
+            attn = self._attn_layers[i]
+            kv_cache = attn.kv_cache
+            attn.impl.do_kv_cache_update(
+                attn,
+                all_k_final[i],
+                all_v[i],
+                kv_cache,
+                slot_mapping,
+            )
     finally:
         if timing:
             torch.npu.synchronize()
