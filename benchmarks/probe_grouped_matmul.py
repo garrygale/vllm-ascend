@@ -38,6 +38,8 @@ Run directly on an NPU:
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch_npu
 
@@ -67,32 +69,11 @@ def _pack_int4(w_int: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_convert_weight_to_int4pack(w_int.t().contiguous())
 
 
-def _unpack_int4(packed: torch.Tensor, n: int, reverse_nibbles: bool = False):
-    """Unpack [K, n//8] int32 into [K, n] signed int4 values (on CPU)."""
-    packed = packed.detach().cpu()
-    k_dim = packed.shape[0]
-    nibbles = torch.zeros(k_dim, n, dtype=torch.int32)
-    for b in range(8):
-        src = 7 - b if reverse_nibbles else b
-        nibbles[:, b::8] = (packed >> (4 * src)) & 0xF
-    return torch.where(nibbles >= 8, nibbles - 16, nibbles)
-
-
 def _diag(name: str, ok: bool, detail: str = "") -> None:
     print(
         f"{name:52s} {'OK' if ok else 'FAIL'} {detail}",
         flush=True,
     )
-
-
-def _try_layout(name: str, fn):
-    try:
-        t = fn()
-        print(f"{name:44s} OK   shape={tuple(t.shape)}", flush=True)
-        return t
-    except Exception as exc:  # noqa: BLE001
-        print(f"{name:44s} FAIL {type(exc).__name__}: {exc}", flush=True)
-        return None
 
 
 def _ref_projection(x: torch.Tensor, w_ints, scales) -> torch.Tensor:
@@ -147,6 +128,61 @@ def _wqb_fallback(x: torch.Tensor, w_cat_nd, scale_2d_bf16) -> torch.Tensor:
             )
         )
     return torch.stack(outs, dim=0)
+
+
+def _make_variants(
+    x: torch.Tensor,
+    group_list: torch.Tensor,
+    w_cat_nd: list[torch.Tensor],
+    scale_2d_bf16: torch.Tensor,
+    offset_3d: list[torch.Tensor],
+    offset_list: list[torch.Tensor],
+) -> list[tuple[str, callable]]:
+    w_3d = torch.stack(w_cat_nd, dim=0)
+    weight_3d = [w_3d]
+    scale_3d = [scale_2d_bf16]
+    weight_list = w_cat_nd
+    scale_list = [scale_2d_bf16[l] for l in range(D)]
+    return [
+        ("G1a split_item=3 3D", lambda: _grouped_call(
+            x, weight_3d, scale_3d, offset_3d, 3, group_list
+        )),
+        ("G1b split_item=2 3D", lambda: _grouped_call(
+            x, weight_3d, scale_3d, offset_3d, 2, group_list
+        )),
+        ("G2 split_item=3 list", lambda: _grouped_call(
+            x, weight_list, scale_list, offset_list, 3, group_list
+        )),
+        ("L per-layer wqb", lambda: _wqb_fallback(
+            x, w_cat_nd, scale_2d_bf16
+        )),
+    ]
+
+
+def _time_eager(fn, iters: int, warmup: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def _time_graph(fn, iters: int, warmup: int) -> float:
+    graph = torch.npu.NPUGraph()
+    stream = torch.npu.Stream()
+    with torch.npu.graph(graph, stream=stream, capture_error_mode="global"):
+        fn()
+    for _ in range(warmup):
+        graph.replay()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        graph.replay()
+    torch.npu.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
 
 
 def _check(
@@ -247,8 +283,6 @@ def main() -> None:
         ],
         dim=0,
     )  # [D, OUT_N]
-    scale_list_bf16 = [scale_2d_bf16[l] for l in range(D)]
-
     print("-" * 60)
     print("diagnostics (isolate pack semantics):")
 
@@ -305,34 +339,8 @@ def main() -> None:
         for _ in range(D)
     ]
 
-    # G1 inputs: single 3D weight + single 2D scale (doc shape [g, n]).
-    w_3d = torch.stack(w_cat_nd, dim=0)
-    weight_3d = [w_3d]
-    scale_3d = [scale_2d_bf16]
-    # G2 inputs: list of 2D weights + list of 1D scales.
-    weight_list = w_cat_nd
-    scale_list = scale_list_bf16
-
-    variants = []
-    variants.append(
-        ("G1a split_item=3 3D", lambda: _grouped_call(
-            x, weight_3d, scale_3d, offset_3d, 3, group_list
-        ))
-    )
-    variants.append(
-        ("G1b split_item=2 3D", lambda: _grouped_call(
-            x, weight_3d, scale_3d, offset_3d, 2, group_list
-        ))
-    )
-    variants.append(
-        ("G2 split_item=3 list", lambda: _grouped_call(
-            x, weight_list, scale_list, offset_list, 3, group_list
-        ))
-    )
-    variants.append(
-        ("L per-layer wqb", lambda: _wqb_fallback(
-            x, w_cat_nd, scale_2d_bf16
-        ))
+    variants = _make_variants(
+        x, group_list, w_cat_nd, scale_2d_bf16, offset_3d, offset_list
     )
 
     print("-" * 60)
@@ -379,6 +387,42 @@ def main() -> None:
                     flush=True,
                 )
                 all_ok = False
+
+    print("-" * 60)
+    print("timing (ms per call, eager vs graph replay):")
+    timing_ts = (8, 64, 256)
+    timing_iters = 20
+    timing_warmup = 5
+    for t_size in timing_ts:
+        x_t = torch.randn(
+            D * t_size, K, dtype=torch.bfloat16, device=device
+        ).contiguous()
+        group_list_t = (
+            torch.arange(1, D + 1, dtype=torch.int64, device=device) * t_size
+        )
+        variants_t = _make_variants(
+            x_t,
+            group_list_t,
+            w_cat_nd,
+            scale_2d_bf16,
+            offset_3d,
+            offset_list,
+        )
+        print(f"T={t_size}:", flush=True)
+        for name, fn in variants_t:
+            try:
+                ms_eager = _time_eager(fn, timing_iters, timing_warmup)
+                ms_graph = _time_graph(fn, timing_iters, timing_warmup)
+                print(
+                    f"  {name:24s} eager={ms_eager:.3f} ms "
+                    f"graph={ms_graph:.3f} ms",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  {name:24s} FAIL {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
     print("=" * 60)
     print("RESULT:", "PASS" if all_ok else "FAIL")
