@@ -78,13 +78,14 @@ def _check_correctness(device) -> None:
     base = torch.randn(b, N_SPEC, V, dtype=torch.bfloat16, device=device)
 
     vals, idx = torch.topk(base, k, dim=-1)
-    wc = w_fc.t()[:, idx]  # [HM, b, n_spec, K]
+    w_fc_t = w_fc.t().contiguous()  # [HM, V]
     corr_full = torch.nn.functional.linear(x_corr, w_fc)  # [b, V]
 
     max_err = 0.0
     for i in range(N_SPEC):
+        wc_i = w_fc_t[:, idx[:, i]]  # [HM, b, K]
         corr_k = torch.einsum(
-            "bm,bmk->bk", x_corr, wc[:, :, i, :].permute(1, 0, 2)
+            "bm,bmk->bk", x_corr, wc_i.permute(1, 0, 2)
         )
         ref = corr_full[:, i].gather(1, idx[:, i])
         max_err = max(max_err, (corr_k - ref).abs().max().item())
@@ -145,11 +146,11 @@ def main() -> None:
         def topk_path(k: int):
             base = torch.nn.functional.linear(x_base, w_base).view(b, N_SPEC, V)
             vals, idx = torch.topk(base, k, dim=-1)
-            wc = w_fc_t[:, idx]  # [HM, b, n_spec, K]
             base_buf.fill_(float("-inf"))
             for i in range(N_SPEC):
+                wc_i = w_fc_t[:, idx[:, i]]  # [HM, b, K]
                 corr_k = torch.einsum(
-                    "bm,bmk->bk", x_corr, wc[:, :, i, :].permute(1, 0, 2)
+                    "bm,bmk->bk", x_corr, wc_i.permute(1, 0, 2)
                 )
                 base_buf[:, i].scatter_(1, idx[:, i], vals[:, i] + corr_k)
             return base_buf
