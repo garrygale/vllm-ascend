@@ -11,6 +11,8 @@ fast bf16 ``torch.bmm`` fused path is unavailable, so the candidate is one
   * single bf16 ``x`` of shape ``[D*T, K]`` (all layers share the input),
   * int32-packed int4 K+V weights (``[K, 2N//8]`` per layer, stacked or as a
     list), with per-channel bf16 ``antiquant_scale``,
+  * ``antiquant_offset`` must be non-null in A16W4 mode (this CANN rejects
+    nullptr); Domino quantization is symmetric, so zeros are passed,
   * a ``group_list`` (cumsum over ``T``) that splits ``x`` by layer.
 
 Variants probed (the doc and the torch_npu tests disagree with the production
@@ -46,7 +48,11 @@ T = 8          # context tokens per layer
 K = 4096       # target hidden size (k_proj_target input)
 N_KV = 1024    # per-projection output size (8 heads * 128)
 OUT_N = 2 * N_KV
-TOLERANCE = 3.0  # absolute max error vs fp32 reference (bf16 numerics)
+# Grouped and per-layer ops should agree tightly (same dequant math).
+TOLERANCE_WQB = 0.5
+# Loose bound vs the fp32 torch reference: bf16 scale rounding and matmul
+# accumulation differences alone reach a few units for K=4096.
+TOLERANCE_FP32 = 5.0
 
 
 def _format_name(t: torch.Tensor) -> str:
@@ -92,6 +98,7 @@ def _grouped_call(
     x: torch.Tensor,
     weights: list[torch.Tensor],
     scales: list[torch.Tensor],
+    offsets: list[torch.Tensor],
     split_item: int,
     group_list: torch.Tensor,
 ) -> torch.Tensor:
@@ -99,6 +106,7 @@ def _grouped_call(
         x=[x],
         weight=weights,
         antiquant_scale=scales,
+        antiquant_offset=offsets,
         group_list=group_list,
         split_item=split_item,
         group_type=0,
@@ -123,12 +131,22 @@ def _wqb_fallback(x: torch.Tensor, w_cat_nd, scale_2d_bf16) -> torch.Tensor:
     return torch.stack(outs, dim=0)
 
 
-def _check(name: str, out: torch.Tensor, ref: torch.Tensor) -> bool:
-    err = (out.float() - ref.float()).abs().max().item()
-    rel = err / ref.float().abs().max().item()
-    ok = err <= TOLERANCE
+def _check(
+    name: str,
+    out: torch.Tensor,
+    ref: torch.Tensor,
+    ref_wqb: torch.Tensor | None = None,
+) -> bool:
+    err_fp32 = (out.float() - ref.float()).abs().max().item()
+    rel = err_fp32 / ref.float().abs().max().item()
+    ok = err_fp32 <= TOLERANCE_FP32
+    err_wqb = None
+    if ref_wqb is not None:
+        err_wqb = (out.float() - ref_wqb.float()).abs().max().item()
+        ok = ok and err_wqb <= TOLERANCE_WQB
     print(
-        f"{name:34s} max_err={err:.4f} rel={rel:.4f} "
+        f"{name:34s} err_fp32={err_fp32:.4f} rel={rel:.4f} "
+        f"err_wqb={'-' if err_wqb is None else f'{err_wqb:.4f}'} "
         f"{'OK' if ok else 'FAIL'}",
         flush=True,
     )
@@ -225,6 +243,14 @@ def main() -> None:
         dim=0,
     )  # [D, OUT_N]
     scale_list_bf16 = [scale_2d_bf16[l] for l in range(D)]
+    ref_wqb = _wqb_fallback(x, w_cat_nd, scale_2d_bf16)
+    offset_3d = [
+        torch.zeros((D, OUT_N), dtype=torch.bfloat16, device=device)
+    ]
+    offset_list = [
+        torch.zeros(OUT_N, dtype=torch.bfloat16, device=device)
+        for _ in range(D)
+    ]
 
     # G1 inputs: single 3D weight + single 2D scale (doc shape [g, n]).
     w_3d = w_cat_nd
@@ -238,23 +264,23 @@ def main() -> None:
     variants = []
     variants.append(
         ("G1a split_item=3 3D", lambda: _grouped_call(
-            x, weight_3d, scale_3d, 3, group_list
+            x, weight_3d, scale_3d, offset_3d, 3, group_list
         ))
     )
     variants.append(
         ("G1b split_item=2 3D", lambda: _grouped_call(
-            x, weight_3d, scale_3d, 2, group_list
+            x, weight_3d, scale_3d, offset_3d, 2, group_list
         ))
     )
     if w_3d_asis is not None:
         variants.append(
             ("G1a as-is formats", lambda: _grouped_call(
-                x, [w_3d_asis], [scale_2d_bf16], 3, group_list
+                x, [w_3d_asis], [scale_2d_bf16], offset_3d, 3, group_list
             ))
         )
     variants.append(
         ("G2 split_item=3 list", lambda: _grouped_call(
-            x, weight_list, scale_list, 3, group_list
+            x, weight_list, scale_list, offset_list, 3, group_list
         ))
     )
     variants.append(
@@ -268,7 +294,12 @@ def main() -> None:
     for name, fn in variants:
         try:
             out = fn()
-            all_ok &= _check(f"{name} eager", out, ref)
+            all_ok &= _check(
+                f"{name} eager",
+                out,
+                ref,
+                None if name.startswith("L ") else ref_wqb,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"{name:34s} eager FAIL {type(exc).__name__}: {exc}", flush=True)
             all_ok = False
@@ -283,7 +314,12 @@ def main() -> None:
                 graph.replay()
                 torch.npu.synchronize()
                 replay_err = (out_g.float() - out.float()).abs().max().item()
-                ok = _check(f"{name} graph[{mode}]", out_g, ref)
+                ok = _check(
+                    f"{name} graph[{mode}]",
+                    out_g,
+                    ref,
+                    None if name.startswith("L ") else ref_wqb,
+                )
                 all_ok &= ok and replay_err == 0.0
                 if replay_err != 0.0:
                     print(
