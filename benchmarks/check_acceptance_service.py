@@ -42,6 +42,8 @@ SERVER_IP = "127.0.0.1"
 SERVER_PORT = 4144
 SERVED_MODEL_NAME = "qwen35"
 TEMPERATURE = 0.0
+TOP_P = 1.0
+TOP_K = 0
 
 DATASET = "gsm8k"  # "humaneval" or "gsm8k"
 DATASET_PATH = "/path/to/gsm8k_test.jsonl"
@@ -157,6 +159,8 @@ def send_completion(
     prompt: str,
     max_tokens: int,
     temperature: float,
+    top_p: float,
+    top_k: int,
     use_chat_template: bool,
     chat_template_kwargs: dict,
 ) -> int:
@@ -168,6 +172,8 @@ def send_completion(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
             "stream": False,
             "chat_template_kwargs": chat_template_kwargs,
         }
@@ -178,6 +184,8 @@ def send_completion(
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
             "stream": False,
         }
     resp = requests.post(
@@ -196,6 +204,8 @@ def main() -> None:
     parser.add_argument("--num-prompts", type=int, default=NUM_PROMPTS)
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
+    parser.add_argument("--top-p", type=float, default=TOP_P)
+    parser.add_argument("--top-k", type=int, default=TOP_K)
     parser.add_argument("--server-ip", default=SERVER_IP)
     parser.add_argument("--server-port", type=int, default=SERVER_PORT)
     parser.add_argument("--served-model-name", default=SERVED_MODEL_NAME)
@@ -230,6 +240,7 @@ def main() -> None:
     print(
         f"Server: {base_url}  model={args.served_model_name}  "
         f"temperature={args.temperature}  "
+        f"top_p={args.top_p}  top_k={args.top_k}  "
         f"chat_template={args.use_chat_template}"
     )
     print(f"Dataset: {args.dataset} ({len(prompts)} prompts)")
@@ -268,6 +279,8 @@ def main() -> None:
                 prompt,
                 args.max_tokens,
                 args.temperature,
+                args.top_p,
+                args.top_k,
                 args.use_chat_template,
                 CHAT_TEMPLATE_KWARGS,
             )
@@ -341,6 +354,8 @@ def main() -> None:
                     prompt,
                     args.max_tokens,
                     args.temperature,
+                    args.top_p,
+                    args.top_k,
                     args.use_chat_template,
                     CHAT_TEMPLATE_KWARGS,
                 )
@@ -377,6 +392,8 @@ def main() -> None:
         "server": base_url,
         "served_model_name": args.served_model_name,
         "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
         "dataset": args.dataset,
         "num_requests": len(prompts),
         "num_workers": args.num_workers,
