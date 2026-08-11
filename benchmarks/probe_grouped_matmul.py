@@ -147,8 +147,13 @@ def _proj_w8a8(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor):
 
 
 def _w8a8_fallback(x: torch.Tensor, w8_list, scale_2d) -> torch.Tensor:
-    """Per-layer npu_dynamic_quant + npu_quant_matmul baseline (7 calls)."""
+    """Per-layer npu_dynamic_quant + npu_quant_matmul baseline (7 calls).
+
+    Consumes the same BF16 weight scale as the grouped A8W8 op so that
+    ``err_wqb`` measures kernel parity, not the FP32-vs-BF16 scale delta.
+    """
     t_size = x.shape[0] // D
+    scale_2d = scale_2d.to(torch.bfloat16)
     outs = []
     for l in range(D):
         outs.append(
