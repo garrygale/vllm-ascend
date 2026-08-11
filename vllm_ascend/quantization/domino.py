@@ -397,6 +397,10 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 fused_scale = fused_scale.to(torch.bfloat16)
             elif scheme_k == "w8a8":
                 packed = fused_int.to(torch.int8).t().contiguous()
+                # A8W8 per-token grouped matmul (aclnnGroupedMatmulV5) only
+                # allows BF16 scale with BF16 output; FLOAT scale requires
+                # FLOAT16 output. Match the W4A8 branch and store BF16.
+                fused_scale = fused_scale.reshape(-1).to(torch.bfloat16)
             else:
                 raise RuntimeError(
                     f"unsupported fused context-KV scheme: {scheme_k}"

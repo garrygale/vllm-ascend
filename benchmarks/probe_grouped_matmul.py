@@ -172,7 +172,9 @@ def _grouped_w8a8(
     out = torch_npu.npu_grouped_matmul(
         x=[x8],
         weight=[w8_3d],
-        scale=[scale_2d],
+        # A8W8 per-token quant requires scale==BF16 when the output is BF16;
+        # FLOAT scale is only valid with FLOAT16 output (aclnnGroupedMatmulV5).
+        scale=[scale_2d.to(torch.bfloat16)],
         per_token_scale=[x8s],
         group_list=group_list,
         split_item=2,
@@ -196,9 +198,10 @@ def _ref_w8a8(x: torch.Tensor, w8_ints, scale_2d) -> torch.Tensor:
         ).float()  # [2N, K]
         x8_l = x8[l * t_size:(l + 1) * t_size].float()
         s_l = x8s[l * t_size:(l + 1) * t_size].unsqueeze(1)
+        scale = scale_2d[l].to(torch.bfloat16).float()  # bf16-rounded, like the op input
         refs.append(
             (x8_l @ fused.t())
-            * scale_2d[l].unsqueeze(0)
+            * scale.unsqueeze(0)
             * s_l
         )
     return torch.stack(refs, dim=0)
