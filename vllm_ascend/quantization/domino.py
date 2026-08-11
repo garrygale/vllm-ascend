@@ -25,31 +25,12 @@ The Domino correction head (``prefix_gru``, ``embed_proj``/``hidden_proj``) is
 never quantized; ``qat_exclude`` is honored in addition.
 """
 
-import os
-
 import torch
 import torch_npu
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 
 ACL_FORMAT_ND = 2
-
-
-def _fused_kv_force_per_layer() -> bool:
-    """``VLLM_ASCEND_DOMINO_FUSED_KV=0`` disables the fused context-KV path
-    entirely (buffer construction and runtime selection)."""
-    return os.environ.get(
-        "VLLM_ASCEND_DOMINO_FUSED_KV", "1"
-    ).strip().lower() in ("0", "false", "no", "off")
-
-
-def _fused_qkv_disabled() -> bool:
-    """``VLLM_ASCEND_DOMINO_FUSED_QKV=0`` keeps the separate q/k/v
-    projections (the bf16 fused projection is slower on NPU; only the
-    quantized fused projection wins)."""
-    return os.environ.get(
-        "VLLM_ASCEND_DOMINO_FUSED_QKV", "1"
-    ).strip().lower() in ("0", "false", "no", "off")
 
 
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
@@ -371,8 +352,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     # happen here while the unpacked values are still available.
     num_layers = model.config.num_hidden_layers
     if (
-        not _fused_kv_force_per_layer()
-        and len(kv_target_pending) == num_layers
+        len(kv_target_pending) == num_layers
         and all(
             len(pair) == 2 and all(len(entry) == 3 for entry in pair.values())
             for pair in kv_target_pending.values()
@@ -427,7 +407,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     # Build the fused draft q/k/v projection buffers (single-pack of the
     # concatenated q+k+v int4 matrix), one per layer, following each layer's
     # scheme (layer 0 is W4A4 in the current config, the rest W4A8).
-    if not _fused_qkv_disabled() and len(qkv_pending) == num_layers and all(
+    if len(qkv_pending) == num_layers and all(
         len(pair) == 3 for pair in qkv_pending.values()
     ):
         fused_qkv_weights = []
@@ -505,11 +485,7 @@ def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
     Returns True when the fused quantized path is active; otherwise the
     per-layer fallback remains in use.
     """
-    if (
-        _fused_kv_force_per_layer()
-        or getattr(model, "_fused_kv_scheme", None)
-        not in ("w4a8", "w8a8")
-    ):
+    if getattr(model, "_fused_kv_scheme", None) not in ("w4a8", "w8a8"):
         model._use_fused_context_kv = False
         return False
 
@@ -553,10 +529,7 @@ def build_quantized_fused_qkv(model: torch.nn.Module) -> bool:
     :func:`quantize_domino_model` are copied onto each ``self_attn`` module so
     the patched attention forward can read them during the draft forward.
     """
-    if (
-        _fused_qkv_disabled()
-        or not getattr(model, "_use_fused_qkv", False)
-    ):
+    if not getattr(model, "_use_fused_qkv", False):
         return False
     for i, attn in enumerate(
         layer.self_attn for layer in model.layers

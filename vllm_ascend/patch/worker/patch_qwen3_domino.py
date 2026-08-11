@@ -14,11 +14,9 @@ With on-the-fly W4A8 quantization, the fused K/V projection is one
 ``[D, K, 2N//8]``, per-layer scales/offsets, ``split_item=2``); the packed
 K+V weights are built as a single pack by ``quantize_domino_model``.
 
-Temporary debug env vars:
+Debug env var:
   * ``VLLM_ASCEND_DOMINO_TIMING=1`` prints each precompute's wall time in us
     (with NPU sync, so it reflects device execution).
-  * ``VLLM_ASCEND_DOMINO_FUSED_KV=0`` forces the per-layer fallback so the
-    fused path can be benchmarked against it.
 """
 
 import os
@@ -281,9 +279,6 @@ def precompute_and_store_context_kv(
     timing = os.environ.get("VLLM_ASCEND_DOMINO_TIMING", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
-    force_per_layer = os.environ.get(
-        "VLLM_ASCEND_DOMINO_FUSED_KV", "1"
-    ).strip().lower() in ("0", "false", "no", "off")
     num_ctx = context_states.shape[0] if context_states.dim() >= 1 else -1
 
     if timing:
@@ -299,7 +294,7 @@ def precompute_and_store_context_kv(
 
         if not hasattr(self, "_num_attn_layers"):
             self._build_fused_kv_buffers()
-        if not self._use_fused_context_kv or force_per_layer:
+        if not self._use_fused_context_kv:
             self._precompute_and_store_context_kv_per_layer(
                 context_states, context_positions, context_slot_mapping
             )
@@ -457,8 +452,7 @@ def precompute_and_store_context_kv(
             torch.npu.synchronize()
             path = (
                 "per-layer"
-                if force_per_layer
-                or not getattr(self, "_use_fused_context_kv", False)
+                if not getattr(self, "_use_fused_context_kv", False)
                 else (
                     "fused-w4a8"
                     if getattr(self, "_fused_kv_quantized", False)
