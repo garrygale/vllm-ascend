@@ -273,6 +273,7 @@ def main() -> None:
     )
 
     # Fused K+V packed in ONE call (no cat-of-packs): isolates the cat.
+    fused_int_0 = torch.cat([w_ints[0][0], w_ints[0][1]], dim=0)  # [2N, K]
     fused_packed = _pack_int4(fused_int_0)
     fused_packed_nd = torch_npu.npu_format_cast(fused_packed, ACL_FORMAT_ND)
     out_fused1 = torch_npu.npu_weight_quant_batchmatmul(
