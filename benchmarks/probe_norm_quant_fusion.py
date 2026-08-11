@@ -160,6 +160,21 @@ def _diag_x8(name: str, x8_f, x8_ref, x8s_f, x8s_ref) -> None:
     return ok
 
 
+def _check_out(name: str, out_f, out_ref, tol_rel: float = 0.02) -> bool:
+    """Compare matmul outputs; fused-vs-separate quantization noise is
+    ~1% relative (1-ulp x8 flips + tiny scale differences), so use a
+    relative bound with an absolute floor."""
+    err = (out_f.float() - out_ref.float()).abs().max().item()
+    ref_max = out_ref.float().abs().max().item()
+    ok = err <= max(TOL_FP32, tol_rel * ref_max)
+    print(
+        f"{name:48s} err={err:.4f} ref_max={ref_max:.4f} "
+        f"{'OK' if ok else 'FAIL'}",
+        flush=True,
+    )
+    return ok
+
+
 def main() -> None:
     print(f"torch_npu version: {getattr(torch_npu, '__version__', 'unknown')}")
     torch.npu.config.allow_internal_format = True
@@ -235,8 +250,8 @@ def main() -> None:
     ).to(torch.int8).t().contiguous()
     s_gu = torch.rand(2 * IM, device=device) * 0.9 + 0.1
 
-    def _gate_up_sep(h: torch.Tensor) -> torch.Tensor:
-        normed = _rms_norm_ref(h, w_norm, EPS)
+    def _gate_up_sep(h: torch.Tensor, res: torch.Tensor) -> torch.Tensor:
+        normed = _rms_norm_ref(h + res, w_norm, EPS)
         x8, x8s = _quant_ref(normed)
         return torch_npu.npu_quant_matmul(
             x8, w_gu, s_gu, pertoken_scale=x8s, bias=None,
@@ -252,15 +267,10 @@ def main() -> None:
             bias=None, output_dtype=h.dtype,
         )
 
-    gu_ref = _gate_up_sep(x)
-    gu_f = _gate_up_fused(x, torch.randn_like(x))
-    err_gu = (gu_f.float() - gu_ref.float()).abs().max().item()
-    print(
-        f"  gate_up matmul (fused norm+quant)         "
-        f"err={err_gu:.4f} {'OK' if err_gu <= TOL_FP32 else 'FAIL'}",
-        flush=True,
-    )
-    all_ok &= err_gu <= TOL_FP32
+    res_gu = torch.randn_like(x)
+    gu_ref = _gate_up_sep(x, res_gu)
+    gu_f = _gate_up_fused(x, res_gu.clone())
+    all_ok &= _check_out("gate_up matmul (fused norm+quant)", gu_f, gu_ref)
 
     # --- Context-KV: fused norm+quant -> grouped matmul ---
     w_kv = torch.randint(
@@ -296,28 +306,28 @@ def main() -> None:
     out_ref = _ctx_grouped(x_ctx, group_list, x8_ref, x8s_ref)
     x8_f, x8s_f = _rms_norm_dynamic_quant(x_ctx, w_hn, EPS)
     out_f = _ctx_grouped(x_ctx, group_list, x8_f, x8s_f)
-    err_ctx = (out_f.float() - out_ref.float()).abs().max().item()
     all_ok &= _diag_x8(
         "context-KV norm+quant", x8_f, x8_ref, x8s_f, x8s_ref
     )
-    print(
-        f"  context-KV grouped out vs separate       "
-        f"err={err_ctx:.4f} {'OK' if err_ctx <= TOL_FP32 else 'FAIL'}",
-        flush=True,
-    )
-    all_ok &= err_ctx <= TOL_FP32
+    all_ok &= _check_out("context-KV grouped out", out_f, out_ref)
 
     print("-" * 60)
     print("graph capture / replay parity (replay vs eager):")
+    # The add variant mutates its residual in place (residual = x + residual),
+    # so replay must run on the same pristine input state as the eager call.
+    res_buf = torch.randn_like(x)
+    res_p = res_buf.clone()
+    restore_res = lambda: res_buf.copy_(res_p)  # noqa: E731
     cases = [
         (
             "rms_norm_dynamic_quant",
             lambda: (x,),
             lambda x_in: _rms_norm_dynamic_quant(x_in, w_norm, EPS),
+            None,
         ),
         (
             "add_rms_norm_dynamic_quant",
-            lambda: (x, torch.randn_like(x)),
+            lambda: (x, res_buf),
             lambda x_in, res_in: torch.ops.npu.npu_add_rms_norm_dynamic_quant(
                 x_in,
                 res_in,
@@ -325,11 +335,13 @@ def main() -> None:
                 epsilon=EPS,
                 output_mask=[True, False],
             ),
+            restore_res,
         ),
         (
             "gate_up matmul (fused norm+quant)",
-            lambda: (x, torch.randn_like(x)),
+            lambda: (x, res_buf),
             _gate_up_fused,
+            restore_res,
         ),
         (
             "context-KV norm+quant+grouped",
@@ -339,15 +351,20 @@ def main() -> None:
                 group_list,
                 *_rms_norm_dynamic_quant(x_in, w_hn, EPS),
             ),
+            None,
         ),
     ]
-    for name, make_inputs, fn in cases:
+    for name, make_inputs, fn, restore in cases:
         for mode in ("global", "relaxed"):
             try:
+                if restore is not None:
+                    restore()
                 eager_out = fn(*make_inputs())
                 if not isinstance(eager_out, (tuple, list)):
                     eager_out = (eager_out,)
                 graph_inputs = make_inputs()
+                if restore is not None:
+                    restore()
                 g = torch.npu.NPUGraph()
                 stream = torch.npu.Stream()
                 with torch.npu.graph(
@@ -356,6 +373,8 @@ def main() -> None:
                     graph_out = fn(*graph_inputs)
                 if not isinstance(graph_out, (tuple, list)):
                     graph_out = (graph_out,)
+                if restore is not None:
+                    restore()
                 g.replay()
                 torch.npu.synchronize()
                 err = 0.0
@@ -398,7 +417,7 @@ def main() -> None:
             ),
             (
                 "sep gate_up (norm+quant+matmul)",
-                lambda: _gate_up_sep(x_m),
+                lambda: _gate_up_sep(x_m, res_m),
             ),
             (
                 "fus gate_up (add_rms_norm_dynamic_quant+matmul)",
