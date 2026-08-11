@@ -27,8 +27,11 @@ import time
 import torch
 import torch_npu
 
-from vllm.model_executor.models.qwen3_domino import DominoQwen3Attention
-from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
+from vllm.model_executor.models.qwen3_domino import (
+    DominoQwen3Attention,
+    DominoQwen3DecoderLayer,
+    Qwen3DominoModel,
+)
 
 try:
     from vllm_ascend.ops.triton.spec_decode.domino_kv_utils import (
@@ -38,16 +41,44 @@ except Exception:  # noqa: BLE001  (triton unavailable)
     domino_grouped_k_norm = None
 
 
+def _resolve_rnq_op():
+    """RMSNorm + int8 dynamic quant (non-residual), from vllm-ascend's
+    compiled extension; used by the fused context-KV precompute."""
+    _c_ascend = getattr(torch.ops, "_C_ascend", None)
+    if _c_ascend is not None and hasattr(
+        _c_ascend, "npu_rms_norm_dynamic_quant"
+    ):
+        return _c_ascend.npu_rms_norm_dynamic_quant
+    return None
+
+
+_RNQ_OP = _resolve_rnq_op()
+
+
+_ORIGINAL_DOMINO_LAYER_FORWARD = DominoQwen3DecoderLayer.forward
+_ORIGINAL_DOMINO_MODEL_FORWARD = Qwen3DominoModel.forward
+
+
+def _squeeze_scale(s: torch.Tensor) -> torch.Tensor:
+    return s.squeeze(-1) if s.dim() == 2 else s
+
+
 def _ascend_domino_attention_forward(
     self: DominoQwen3Attention,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
+    x8: torch.Tensor | None = None,
+    x8s: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Domino attention forward with the optional fused quantized qkv.
 
     The fused path is attached by ``build_quantized_fused_qkv`` after
     on-the-fly quantization (W4A8 single-pack or W4A4 packed q+k+v, one
-    projection call per layer).  The fused projection also feeds
+    projection call per layer).  In the all-W8A8 norm+quant fusion
+    (``_use_fused_norm_quant``) the layer forward already ran
+    ``npu_add_rms_norm_dynamic_quant`` and passes ``x8``/``x8s`` so the
+    projection skips its own activation quant.  The fused projection also
+    feeds
     ``qkv_rmsnorm_rope``, which applies q/k RMSNorm + RoPE in one kernel
     (probe: ~2x faster than split + two norms + rope).  The bf16 path keeps
     the separate q/k/v linears, since a fused bf16 projection is slower on
@@ -75,9 +106,10 @@ def _ascend_domino_attention_forward(
                 output_dtype=torch.float16,
             ).to(hidden_states.dtype)
         elif scheme == "w8a8":
-            x8, x8s = torch_npu.npu_dynamic_quant(hidden_states)
-            if x8s.dim() == 2:
-                x8s = x8s.squeeze(1)
+            if x8 is None or x8s is None:
+                x8, x8s = torch_npu.npu_dynamic_quant(hidden_states)
+                if x8s.dim() == 2:
+                    x8s = x8s.squeeze(1)
             qkv = torch_npu.npu_quant_matmul(
                 x8,
                 self._fused_qkv_weight,
@@ -127,6 +159,119 @@ def _ascend_domino_attention_forward(
     return self.o_proj(attn_output)
 
 
+def _ascend_domino_mlp_forward(
+    mlp,
+    x8: torch.Tensor,
+    x8s: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """W8A8 MLP with a pre-quantized (post-norm) activation.
+
+    ``gate_up_proj`` consumes the fused norm+quant output directly; the
+    SwiGLU activation is unchanged (``npu_swiglu``), and ``down_proj`` keeps
+    its own per-call activation quant (nothing to fuse in front of it).
+    """
+    gate_up = torch_npu.npu_quant_matmul(
+        x8,
+        mlp.gate_up_proj.weight,
+        mlp.gate_up_proj.weight_scale,
+        pertoken_scale=x8s,
+        bias=None,
+        output_dtype=dtype,
+    )
+    x = mlp.act_fn(gate_up)
+    x, _ = mlp.down_proj(x)
+    return x
+
+
+def _ascend_domino_layer_forward(
+    self: DominoQwen3DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Draft decoder layer with the optional all-W8A8 norm+quant fusion.
+
+    When ``_use_fused_norm_quant`` is set the layer follows vLLM's
+    residual-stream pattern (mathematically identical to the classic
+    pre-norm block): each RMSNorm is fused with the residual add and the
+    int8 activation quant, and the updated residual is returned to the model
+    forward.  Otherwise it delegates to the original implementation.
+    """
+    if not getattr(self, "_use_fused_norm_quant", False):
+        return _ORIGINAL_DOMINO_LAYER_FORWARD(
+            self, positions, hidden_states
+        )
+
+    ln1 = self.input_layernorm
+    ln2 = self.post_attention_layernorm
+    if residual is None:
+        # First layer: no accumulated residual; use the non-add fused op.
+        residual = hidden_states
+        x8, x8s = _RNQ_OP(
+            hidden_states, ln1.weight, epsilon=ln1.variance_epsilon
+        )
+    else:
+        out = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            hidden_states,
+            residual,
+            ln1.weight,
+            epsilon=ln1.variance_epsilon,
+            output_mask=[True, False],
+        )
+        x8, x8s, residual = out[0], out[3], out[2]
+    x8s = _squeeze_scale(x8s)
+    attn_out = self.self_attn(
+        positions, hidden_states, x8=x8, x8s=x8s
+    )
+    out = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+        attn_out,
+        residual,
+        ln2.weight,
+        epsilon=ln2.variance_epsilon,
+        output_mask=[True, False],
+    )
+    x8m, x8sm, residual = out[0], out[3], out[2]
+    mlp_out = _ascend_domino_mlp_forward(
+        self.mlp, x8m, _squeeze_scale(x8sm), hidden_states.dtype
+    )
+    return mlp_out, residual
+
+
+def _ascend_domino_model_forward(
+    self: Qwen3DominoModel,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Draft model forward with the optional all-W8A8 residual stream.
+
+    With ``_use_fused_norm_quant`` the layers return ``(hidden, residual)``;
+    the residual (embedding + accumulated attention outputs) is added to the
+    last MLP output before ``output_proj``/final norm, mirroring vLLM's
+    standard decoder loop.  Otherwise the original forward is used.
+    """
+    if not getattr(self, "_use_fused_norm_quant", False):
+        return _ORIGINAL_DOMINO_MODEL_FORWARD(
+            self, input_ids, positions, inputs_embeds
+        )
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_input_ids(input_ids)
+    hidden_states = inputs_embeds
+    if self.input_proj is not None:
+        hidden_states = self.input_proj(hidden_states)
+    residual: torch.Tensor | None = None
+    for layer in self.layers:
+        hidden_states, residual = layer(
+            positions, hidden_states, residual
+        )
+    hidden_states = hidden_states + residual
+    if self.output_proj is not None:
+        hidden_states = self.output_proj(hidden_states)
+    return self.norm(hidden_states)
+
+
 def precompute_and_store_context_kv(
     self,
     context_states: torch.Tensor,
@@ -172,15 +317,30 @@ def precompute_and_store_context_kv(
             # flattened to [T*D, H], normalized in one module call, then
             # projected through the per-layer packed int4 K/V weights with a
             # single npu_grouped_matmul (3D weight + group_list, split_item=2).
-            normed_context_states = self.hidden_norm(
-                context_states.reshape(num_ctx * D, H)
+            fused_norm_quant = (
+                getattr(self, "_use_fused_norm_quant", False)
+                and self._fused_kv_scheme == "w8a8"
+                and _RNQ_OP is not None
             )
-            fused = (
-                normed_context_states.view(num_ctx, D, H)
-                .permute(1, 0, 2)
-                .reshape(D * num_ctx, H)
-                .contiguous()
-            )
+            if fused_norm_quant:
+                # RMSNorm is row-wise, so permute to layer-major order first
+                # and fuse hidden_norm with the int8 activation quant.
+                fused = (
+                    context_states.view(num_ctx, D, H)
+                    .permute(1, 0, 2)
+                    .reshape(D * num_ctx, H)
+                    .contiguous()
+                )
+            else:
+                normed_context_states = self.hidden_norm(
+                    context_states.reshape(num_ctx * D, H)
+                )
+                fused = (
+                    normed_context_states.view(num_ctx, D, H)
+                    .permute(1, 0, 2)
+                    .reshape(D * num_ctx, H)
+                    .contiguous()
+                )
             group_list = self._fused_kv_group_list
             group_list.fill_(num_ctx)
             group_list.cumsum_(0)
@@ -198,7 +358,22 @@ def precompute_and_store_context_kv(
                 )[0]
             else:  # w8a8: quantize the shared activation once, then grouped
                 # int8 x int8 matmul with per-token and per-channel scales.
-                x8, x8s = torch_npu.npu_dynamic_quant(fused)
+                if fused_norm_quant:
+                    x8, x8s = _RNQ_OP(
+                        fused,
+                        getattr(
+                            self,
+                            "_hidden_norm_weight",
+                            self.hidden_norm.weight.data,
+                        ),
+                        epsilon=getattr(
+                            self,
+                            "_hidden_norm_eps",
+                            self.hidden_norm.variance_epsilon,
+                        ),
+                    )
+                else:
+                    x8, x8s = torch_npu.npu_dynamic_quant(fused)
                 if x8s.dim() == 2:
                     x8s = x8s.squeeze(1)
                 all_kv_flat = torch_npu.npu_grouped_matmul(
@@ -301,3 +476,5 @@ Qwen3DominoModel.precompute_and_store_context_kv = (
     precompute_and_store_context_kv
 )
 DominoQwen3Attention.forward = _ascend_domino_attention_forward
+DominoQwen3DecoderLayer.forward = _ascend_domino_layer_forward
+Qwen3DominoModel.forward = _ascend_domino_model_forward

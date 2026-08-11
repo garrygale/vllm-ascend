@@ -15,6 +15,7 @@ from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton,
 )
 from vllm_ascend.quantization.domino import (
+    build_quantized_fused_norm_quant,
     build_quantized_fused_kv_buffers,
     build_quantized_fused_qkv,
     quantize_domino_model,
@@ -93,6 +94,12 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                     print(
                         "[AscendDomino] fused draft qkv projections enabled "
                         "(quantized)",
+                        flush=True,
+                    )
+                if build_quantized_fused_norm_quant(self.model):
+                    print(
+                        "[AscendDomino] W8A8 fused norm+quant enabled "
+                        "(residual-stream draft layers + context-KV)",
                         flush=True,
                     )
 

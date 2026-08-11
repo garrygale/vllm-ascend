@@ -307,6 +307,10 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     count = 0
     model._fused_kv_scheme = None
     model._use_fused_qkv = False
+    # The W8A8 norm+activation-quant fusion (residual-stream draft layers,
+    # fused context-KV norm+quant) only applies when every quantized draft
+    # linear is W8A8.  Any W4A8/W4A4 layer clears this.
+    model._all_w8a8 = qat_w_bit == 8
     kv_target_pending: dict[
         int, dict[str, tuple[torch.Tensor, torch.Tensor, str]]
     ] = {}
@@ -320,6 +324,7 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             continue
 
         if _is_w4a4_layer(path, w4a4_layers):
+            model._all_w8a8 = False
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
             )
@@ -573,4 +578,47 @@ def build_quantized_fused_qkv(model: torch.nn.Module) -> bool:
             attn.rotary_emb.cos_sin_cache.to(torch.bfloat16).contiguous()
         )
         attn._use_fused_qkv = True
+    return True
+
+
+def _rms_norm_dynamic_quant_available() -> bool:
+    """Both fused norm+quant ops must be present on this CANN build."""
+    npu_ns = getattr(torch.ops, "npu", None)
+    _c_ascend = getattr(torch.ops, "_C_ascend", None)
+    return (
+        npu_ns is not None
+        and hasattr(npu_ns, "npu_add_rms_norm_dynamic_quant")
+        and _c_ascend is not None
+        and hasattr(_c_ascend, "npu_rms_norm_dynamic_quant")
+    )
+
+
+def build_quantized_fused_norm_quant(model: torch.nn.Module) -> bool:
+    """Enable the W8A8 norm+activation-quant fusion on the draft model.
+
+    Requires every quantized draft linear to be W8A8 (``model._all_w8a8``),
+    the fused draft qkv to be active with an all-W8A8 scheme list, and both
+    fused norm+quant ops to be available on this CANN.  When enabled:
+
+      * the decoder layers switch to the residual-stream pattern
+        (``npu_add_rms_norm_dynamic_quant`` / ``npu_rms_norm_dynamic_quant``)
+        and feed pre-quantized activations to the attention and gate_up
+        matmuls,
+      * the fused context-KV precompute fuses ``hidden_norm`` with the
+        activation quant before the grouped matmul.
+    """
+    if (
+        not getattr(model, "_all_w8a8", False)
+        or not _rms_norm_dynamic_quant_available()
+        or not getattr(model, "_use_fused_qkv", False)
+        or any(
+            scheme != "w8a8"
+            for scheme in getattr(model, "_fused_qkv_scheme", [])
+        )
+    ):
+        model._use_fused_norm_quant = False
+        return False
+    for layer in model.layers:
+        layer._use_fused_norm_quant = True
+    model._use_fused_norm_quant = True
     return True
