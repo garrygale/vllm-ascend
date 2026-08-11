@@ -26,6 +26,7 @@ import torch
 import torch_npu
 
 import vllm_ascend.ops  # noqa: F401  (registers the custom ops)
+from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 NQ = 4096
 NKV = 1024
@@ -129,6 +130,7 @@ def _time(fn, iters: int, warmup: int, graph: bool) -> float:
 def main() -> None:
     print(f"torch_npu version: {getattr(torch_npu, '__version__', 'unknown')}")
     torch.npu.config.allow_internal_format = True
+    init_device_properties_triton()
     print("allow_internal_format=True (service-like)")
     print(f"NQ={NQ} NKV={NKV} HEAD_DIM={HEAD_DIM} Ms={MS}")
 
