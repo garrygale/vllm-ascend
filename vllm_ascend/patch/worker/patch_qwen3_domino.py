@@ -233,7 +233,14 @@ def precompute_and_store_context_kv(
         all_k_final = all_k_flat.view(D, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         fused_ok = False
-        if fused_kv_cache_write is not None and D == 7:
+        fused_write_env = os.environ.get(
+            "VLLM_ASCEND_DOMINO_FUSED_KV_WRITE", "0"
+        ).strip().lower()
+        if (
+            fused_write_env in ("1", "true", "yes", "on")
+            and fused_kv_cache_write is not None
+            and D == 7
+        ):
             slots_list = (
                 list(context_slot_mapping)
                 if per_layer

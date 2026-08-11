@@ -138,10 +138,21 @@ def main() -> None:
     for l in range(D):
         ref2_k[l].view(-1, NKV, HD)[slots[l]] = all_k[l]
         ref2_v[l].view(-1, NKV, HD)[slots[l]] = all_v[l]
+    torch.npu.synchronize()
+
+    scatter_vs_flat = max(
+        (ref_k[l].float() - ref2_k[l].float()).abs().max().item()
+        for l in range(D)
+    )
+    print(
+        f"  reference sanity: scatter vs flat-copy max_err="
+        f"{scatter_vs_flat:.6f}"
+    )
 
     fused_ok = fused_kv_cache_write(
         all_k, all_v, key_caches, value_caches, [slots[l] for l in range(D)]
     )
+    torch.npu.synchronize()
     print(f"  fused_kv_cache_write returned {fused_ok}")
     if fused_ok:
         err_prod = max(
