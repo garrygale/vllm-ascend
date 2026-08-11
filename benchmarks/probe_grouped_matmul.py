@@ -206,7 +206,7 @@ def main() -> None:
     )
     ref = _ref_projection(x, w_ints, scales)
 
-    print("packed weight formats / fused single-pack stack:")
+    print("packed weight formats / fused single-pack list:")
     print(
         f"packed_k[0] format={_format_name(packed_k[0])} "
         f"packed_v[0] format={_format_name(packed_v[0])}"
@@ -215,25 +215,30 @@ def main() -> None:
     # K and V separately and concatenating the packed tensors is NOT valid on
     # this CANN (the op misreads the concatenated layout), so this is the only
     # safe construction.
-    fused_packed_nd_list = _try_layout(
-        "fused single-pack x7 (pack cat([K,V]) once)",
-        lambda: torch.stack(
-            [
+    fused_w_list = []
+    try:
+        for l in range(D):
+            fused_int = torch.cat([w_ints[l][0], w_ints[l][1]], dim=0)
+            fused_w_list.append(
                 torch_npu.npu_format_cast(
-                    _pack_int4(
-                        torch.cat([w_ints[l][0], w_ints[l][1]], dim=0)
-                    ),
-                    ACL_FORMAT_ND,
+                    _pack_int4(fused_int), ACL_FORMAT_ND
                 )
-                for l in range(D)
-            ],
-            dim=0,
-        ),
-    )
-    if fused_packed_nd_list is None:
+            )
+        print(
+            "fused single-pack x7 (pack cat([K,V]) once): "
+            f"OK shapes={[tuple(w.shape) for w in fused_w_list]}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"fused single-pack x7: FAIL {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return
+    if len(fused_w_list) != D:
         print("cannot build fused single-pack weights; aborting", flush=True)
         return
-    w_cat_nd = fused_packed_nd_list
+    w_cat_nd = fused_w_list  # list of [K, 2N//8] per layer
 
     scale_2d_bf16 = torch.stack(
         [
@@ -301,11 +306,11 @@ def main() -> None:
     ]
 
     # G1 inputs: single 3D weight + single 2D scale (doc shape [g, n]).
-    w_3d = w_cat_nd
+    w_3d = torch.stack(w_cat_nd, dim=0)
     weight_3d = [w_3d]
     scale_3d = [scale_2d_bf16]
     # G2 inputs: list of 2D weights + list of 1D scales.
-    weight_list = [w_cat_nd[l] for l in range(D)]
+    weight_list = w_cat_nd
     scale_list = scale_list_bf16
 
     variants = []
