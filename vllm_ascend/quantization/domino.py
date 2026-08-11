@@ -25,12 +25,22 @@ The Domino correction head (``prefix_gru``, ``embed_proj``/``hidden_proj``) is
 never quantized; ``qat_exclude`` is honored in addition.
 """
 
+import os
+
 import torch
 import torch_npu
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 
 ACL_FORMAT_ND = 2
+
+
+def _fused_kv_force_per_layer() -> bool:
+    """``VLLM_ASCEND_DOMINO_FUSED_KV=0`` disables the fused context-KV path
+    entirely (buffer construction and runtime selection)."""
+    return os.environ.get(
+        "VLLM_ASCEND_DOMINO_FUSED_KV", "1"
+    ).strip().lower() in ("0", "false", "no", "off")
 
 
 def _stochastic_round(x: torch.Tensor) -> torch.Tensor:
@@ -335,7 +345,8 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
     # values are still available.
     num_layers = model.config.num_hidden_layers
     if (
-        len(kv_target_pending) == num_layers
+        not _fused_kv_force_per_layer()
+        and len(kv_target_pending) == num_layers
         and all(
             len(pair) == 2 for pair in kv_target_pending.values()
         )
@@ -384,7 +395,10 @@ def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
     Returns True when the fused quantized path is active; otherwise the
     per-layer fallback remains in use.
     """
-    if getattr(model, "_fused_kv_scheme", None) != "w4a8":
+    if (
+        _fused_kv_force_per_layer()
+        or getattr(model, "_fused_kv_scheme", None) != "w4a8"
+    ):
         model._use_fused_context_kv = False
         return False
 
