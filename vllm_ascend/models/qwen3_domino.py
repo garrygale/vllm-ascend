@@ -86,7 +86,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 if quant_fused:
                     print(
                         "[AscendDomino] quantized fused context-KV "
-                        "precompute enabled (W4A8)",
+                        f"precompute enabled ({self.model._fused_kv_scheme})",
                         flush=True,
                     )
                 if build_quantized_fused_qkv(self.model):

@@ -377,7 +377,8 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
         not _fused_kv_force_per_layer()
         and len(kv_target_pending) == num_layers
         and all(
-            len(pair) == 3 for pair in kv_target_pending.values()
+            len(pair) == 2 and all(len(entry) == 3 for entry in pair.values())
+            for pair in kv_target_pending.values()
         )
     ):
         fused_weights = []
