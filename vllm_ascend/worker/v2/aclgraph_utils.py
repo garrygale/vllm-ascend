@@ -224,10 +224,6 @@ class ModelWithContext(nn.Module):
     def pure_draft_prefix_len(self) -> int:
         return self.original_model.pure_draft_prefix_len
 
-    @property
-    def _use_domino_triton_gru(self) -> bool:
-        return getattr(self.original_model, "_use_domino_triton_gru", False)
-
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)
 

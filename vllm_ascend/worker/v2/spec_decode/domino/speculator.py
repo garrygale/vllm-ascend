@@ -89,20 +89,10 @@ class AscendDominoSpeculator(DominoSpeculator):
     ) -> None:
         """Triton-table GRU + fused-h zpart correction loop.
 
-        Enabled by ``VLLM_ASCEND_DOMINO_TRITON_GRU=1`` (and TP=1).  Falls back
-        to the base manual implementation otherwise.  The correction head
+        Default path (no env gate / manual fallback).  The correction head
         still produces full logits through the aclnn fc2 matmul, so sampling
         (Gumbel/top-k/top-p) is unaffected.
         """
-        if not getattr(self.model, "_use_domino_triton_gru", False):
-            self._log_triton_status(
-                "disabled (env="
-                f"{os.environ.get('VLLM_ASCEND_DOMINO_TRITON_GRU', '')!r})"
-            )
-            super()._sample_sequential(num_reqs, head_hidden)
-            self._maybe_log_draft_tokens(num_reqs, "manual")
-            return
-
         self._log_triton_status("active")
 
         n_spec = self.num_speculative_steps
