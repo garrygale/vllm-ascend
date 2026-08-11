@@ -40,7 +40,18 @@ import torch
 import torch_npu
 
 # The non-add RMSNorm+quant op is registered by vllm-ascend's compiled
-# extension (``torch.ops._C_ascend``); the standalone probe must load it.
+# extension (``torch.ops._C_ascend``) and backed by the vendored CANN custom
+# op library (``libcust_opapi.so``).  The service calls
+# ``bootstrap_custom_op_env(include_vendor_lib=True)`` before loading the
+# extension; the standalone probe must do the same or the aclnn symbol
+# resolves from the standard libopapi.so and is missing.
+try:
+    from vllm_ascend.utils import bootstrap_custom_op_env
+
+    bootstrap_custom_op_env(include_vendor_lib=True)
+except Exception as exc:  # noqa: BLE001
+    print(f"WARNING: custom op env bootstrap failed: {exc}")
+
 try:
     import vllm_ascend.vllm_ascend_C  # noqa: F401
 except Exception as exc:  # noqa: BLE001
