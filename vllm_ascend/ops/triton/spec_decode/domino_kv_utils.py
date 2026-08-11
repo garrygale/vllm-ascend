@@ -22,24 +22,41 @@ def _grouped_k_norm_kernel(
     x_ptr,
     w_ptr,
     out_ptr,
+    total_rows,
     rows_per_layer,
     hd: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_HD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    layer = row // rows_per_layer
+    core_id = tl.program_id(0)
+    core_num = tl.num_programs(0)
+    rows_per_core = tl.cdiv(total_rows, core_num)
+    start = core_id * rows_per_core
+    end = tl.minimum(start + rows_per_core, total_rows)
     offs = tl.arange(0, BLOCK_HD)
-    mask = offs < hd
-    x = tl.load(x_ptr + row * hd + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    w = tl.load(
-        w_ptr + layer * hd + offs, mask=mask, other=0.0
-    ).to(tl.float32)
-    mean_sq = tl.sum(x * x, axis=0) / hd
-    y = x * tl.rsqrt(mean_sq + eps) * w
-    tl.store(out_ptr + row * hd + offs, y.to(tl.bfloat16), mask=mask)
+    for row_start in tl.range(start, end, BLOCK_M):
+        rows = row_start + tl.arange(0, BLOCK_M)
+        mask_r = rows < total_rows
+        mask = mask_r[:, None] & (offs[None, :] < hd)
+        x = tl.load(
+            x_ptr + rows[:, None] * hd + offs[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        layer = rows // rows_per_layer
+        w = tl.load(
+            w_ptr + layer[:, None] * hd + offs[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        mean_sq = tl.sum(x * x, axis=1) / hd
+        y = x * tl.rsqrt(mean_sq[:, None] + eps) * w
+        tl.store(
+            out_ptr + rows[:, None] * hd + offs[None, :],
+            y.to(tl.bfloat16),
+            mask=mask,
+        )
 
 
 def domino_grouped_k_norm(
@@ -54,14 +71,21 @@ def domino_grouped_k_norm(
     w_flat = weight.contiguous()
     out = torch.empty_like(x_flat)
     BLOCK_HD = triton.next_power_of_2(hd)
-    _grouped_k_norm_kernel[(x_flat.shape[0],)](
+    props = triton.runtime.driver.active.utils.get_device_properties(
+        x.device
+    )
+    num_cores = props.get("num_vectorcore", -1)
+    if num_cores <= 0:
+        num_cores = min(64, x_flat.shape[0])
+    _grouped_k_norm_kernel[(num_cores,)](
         x_flat,
         w_flat,
         out,
+        x_flat.shape[0],
         t * nkv,
         hd=hd,
         eps=eps,
         BLOCK_HD=BLOCK_HD,
+        BLOCK_M=16,
     )
     return out.view(d, t, nkv, hd)
-
