@@ -6,8 +6,8 @@
 Domino's W8A8 draft path currently runs, per layer:
 
   * residual add -> RMSNorm -> ``npu_dynamic_quant`` -> fused qkv matmul,
-  * residual add -> RMSNorm -> ``npu_dynamic_quant`` -> gate/up matmuls
-    (gate and up quantize the same tensor twice),
+  * residual add -> RMSNorm -> ``npu_dynamic_quant`` -> merged gate_up
+    matmul (``Qwen2MLP``: one ``gate_up_proj`` + ``npu_swiglu``),
 
 and the fused context-KV precompute runs:
 
@@ -23,7 +23,8 @@ This probe validates the two fused ops that collapse those chains:
 
 Checks:
 
-  * fused-vs-separate correctness on the real Domino dims,
+  * fused-vs-separate correctness on the real Domino dims (including the
+    merged gate_up matmul pattern),
   * graph capture (GLOBAL/RELAXED) + replay parity,
   * timing (eager + graph replay) at decode-sized token counts.
 
@@ -181,57 +182,38 @@ def main() -> None:
     )
     all_ok &= err_res <= 0.05
 
-    # --- Gate/up shared quant: one fused norm+quant -> two matmuls ---
-    w_gate = torch.randint(
-        -128, 127, (IM, K), dtype=torch.int32, device=device
+    # --- Merged gate_up matmul: one fused norm+quant -> one matmul ---
+    w_gu = torch.randint(
+        -128, 127, (2 * IM, K), dtype=torch.int32, device=device
     ).to(torch.int8).t().contiguous()
-    w_up = torch.randint(
-        -128, 127, (IM, K), dtype=torch.int32, device=device
-    ).to(torch.int8).t().contiguous()
-    s_gate = torch.rand(IM, device=device) * 0.9 + 0.1
-    s_up = torch.rand(IM, device=device) * 0.9 + 0.1
+    s_gu = torch.rand(2 * IM, device=device) * 0.9 + 0.1
 
-    def _gate_up_sep(h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _gate_up_sep(h: torch.Tensor) -> torch.Tensor:
         normed = _rms_norm_ref(h, w_norm, EPS)
-        g8, gs = _quant_ref(normed)
-        u8, us = _quant_ref(normed)
-        return (
-            torch_npu.npu_quant_matmul(
-                g8, w_gate, s_gate, pertoken_scale=gs, bias=None,
-                output_dtype=h.dtype,
-            ),
-            torch_npu.npu_quant_matmul(
-                u8, w_up, s_up, pertoken_scale=us, bias=None,
-                output_dtype=h.dtype,
-            ),
+        x8, x8s = _quant_ref(normed)
+        return torch_npu.npu_quant_matmul(
+            x8, w_gu, s_gu, pertoken_scale=x8s, bias=None,
+            output_dtype=h.dtype,
         )
 
-    def _gate_up_fused(h: torch.Tensor, res: torch.Tensor):
+    def _gate_up_fused(h: torch.Tensor, res: torch.Tensor) -> torch.Tensor:
         o = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
             h, res, w_norm, epsilon=EPS, output_mask=[True, False]
         )
-        return (
-            torch_npu.npu_quant_matmul(
-                o[0], w_gate, s_gate, pertoken_scale=_squeeze_scale(o[3]),
-                bias=None, output_dtype=h.dtype,
-            ),
-            torch_npu.npu_quant_matmul(
-                o[0], w_up, s_up, pertoken_scale=_squeeze_scale(o[3]),
-                bias=None, output_dtype=h.dtype,
-            ),
+        return torch_npu.npu_quant_matmul(
+            o[0], w_gu, s_gu, pertoken_scale=_squeeze_scale(o[3]),
+            bias=None, output_dtype=h.dtype,
         )
 
-    g_ref, u_ref = _gate_up_sep(x)
-    g_f, u_f = _gate_up_fused(x, torch.randn_like(x))
-    err_g = (g_f.float() - g_ref.float()).abs().max().item()
-    err_u = (u_f.float() - u_ref.float()).abs().max().item()
+    gu_ref = _gate_up_sep(x)
+    gu_f = _gate_up_fused(x, torch.randn_like(x))
+    err_gu = (gu_f.float() - gu_ref.float()).abs().max().item()
     print(
-        f"  gate/up shared-quant                      "
-        f"gate_err={err_g:.4f} up_err={err_u:.4f} "
-        f"{'OK' if max(err_g, err_u) <= TOL_FP32 else 'FAIL'}",
+        f"  gate_up matmul (fused norm+quant)         "
+        f"err={err_gu:.4f} {'OK' if err_gu <= TOL_FP32 else 'FAIL'}",
         flush=True,
     )
-    all_ok &= max(err_g, err_u) <= TOL_FP32
+    all_ok &= err_gu <= TOL_FP32
 
     # --- Context-KV: fused norm+quant -> grouped matmul ---
     w_kv = torch.randint(
@@ -302,7 +284,7 @@ def main() -> None:
             ),
         ),
         (
-            "gate/up shared-quant",
+            "gate_up matmul (fused norm+quant)",
             lambda: (x, torch.randn_like(x)),
             _gate_up_fused,
         ),
@@ -374,11 +356,11 @@ def main() -> None:
                 ),
             ),
             (
-                "sep gate/up (2x quant)",
+                "sep gate_up (norm+quant+matmul)",
                 lambda: _gate_up_sep(x_m),
             ),
             (
-                "fus gate/up (shared quant)",
+                "fus gate_up (add_rms_norm_dynamic_quant+matmul)",
                 lambda: _gate_up_fused(x_m, res_m),
             ),
         ]
