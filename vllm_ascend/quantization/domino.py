@@ -329,14 +329,12 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 module.weight.data, 4, stochastic
             )
             _quantize_w4a4(module, w_int, scale)
-            scheme = "W4A4"
             _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w4a4")
         elif qat_w_bit == 4:
             w_int, scale = quantize_weight_per_channel(
                 module.weight.data, 4, stochastic
             )
             _quantize_w4a8(module, w_int, scale)
-            scheme = "W4A8"
             _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w4a8")
             if path.endswith(".k_proj_target") or path.endswith(
                 ".v_proj_target"
@@ -353,7 +351,6 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 module.weight.data, 8, stochastic
             )
             _quantize_w8a8(module, w_int, scale)
-            scheme = "W8A8"
             _maybe_record_draft_qkv(qkv_pending, path, w_int, scale, "w8a8")
             if path.endswith(".k_proj_target") or path.endswith(
                 ".v_proj_target"
@@ -367,11 +364,6 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
                 )
 
         count += 1
-        print(
-            f"[DominoQuant] {scheme} model.{path} "
-            f"weight={tuple(module.weight.shape)}",
-            flush=True,
-        )
 
     # Build the fused context-KV buffers (single-pack of the concatenated
     # K+V matrix: int4 for W4A8, int8 for W8A8).  Concatenating two
