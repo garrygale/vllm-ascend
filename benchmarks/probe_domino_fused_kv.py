@@ -94,10 +94,10 @@ def main() -> None:
     print("grouped k-norm:")
     ref = torch.empty_like(all_k)
     for l in range(D):
-        ref[l], _ = torch_npu.npu_rms_norm(
+        normed, _ = torch_npu.npu_rms_norm(
             all_k[l].reshape(T * NKV, HD), w[l], EPS
         )
-        ref[l] = ref[l].view(T, NKV, HD)
+        ref[l] = normed.view(T, NKV, HD)
     out = domino_grouped_k_norm(all_k, w, EPS)
     err = (out.float() - ref.float()).abs().max().item()
     print(f"  max_err={err:.6f} {'OK' if err <= TOLERANCE else 'FAIL'}")
@@ -198,10 +198,10 @@ def main() -> None:
     def k_norm_loop():
         out_loop = torch.empty_like(all_k)
         for l in range(D):
-            out_loop[l], _ = torch_npu.npu_rms_norm(
+            normed, _ = torch_npu.npu_rms_norm(
                 all_k[l].reshape(T * NKV, HD), w[l], EPS
             )
-            out_loop[l] = out_loop[l].view(T, NKV, HD)
+            out_loop[l] = normed.view(T, NKV, HD)
         return out_loop
 
     def cache_fused():
