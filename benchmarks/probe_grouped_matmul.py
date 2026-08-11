@@ -67,6 +67,24 @@ def _pack_int4(w_int: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_convert_weight_to_int4pack(w_int.t().contiguous())
 
 
+def _unpack_int4(packed: torch.Tensor, n: int, reverse_nibbles: bool = False):
+    """Unpack [K, n//8] int32 into [K, n] signed int4 values (on CPU)."""
+    packed = packed.detach().cpu()
+    k_dim = packed.shape[0]
+    nibbles = torch.zeros(k_dim, n, dtype=torch.int32)
+    for b in range(8):
+        src = 7 - b if reverse_nibbles else b
+        nibbles[:, b::8] = (packed >> (4 * src)) & 0xF
+    return torch.where(nibbles >= 8, nibbles - 16, nibbles)
+
+
+def _diag(name: str, ok: bool, detail: str = "") -> None:
+    print(
+        f"{name:52s} {'OK' if ok else 'FAIL'} {detail}",
+        flush=True,
+    )
+
+
 def _try_layout(name: str, fn):
     try:
         t = fn()
@@ -188,7 +206,6 @@ def main() -> None:
     )
     ref = _ref_projection(x, w_ints, scales)
 
-    print("-" * 60)
     print("packed weight formats / cat / stack:")
     print(
         f"packed_k[0] format={_format_name(packed_k[0])} "
@@ -243,6 +260,65 @@ def main() -> None:
         dim=0,
     )  # [D, OUT_N]
     scale_list_bf16 = [scale_2d_bf16[l] for l in range(D)]
+
+    print("-" * 60)
+    print("diagnostics (isolate pack / cat / scale semantics):")
+    fused_int_0 = torch.cat([w_ints[0][0], w_ints[0][1]], dim=0)  # [2N, K]
+    _diag(
+        "unpack(cat packed) == w_int (nibble b)",
+        torch.equal(_unpack_int4(w_cat_nd[0], OUT_N), fused_int_0.cpu()),
+    )
+    _diag(
+        "unpack(cat packed) == w_int (nibble 7-b)",
+        torch.equal(
+            _unpack_int4(w_cat_nd[0], OUT_N, reverse_nibbles=True),
+            fused_int_0.cpu(),
+        ),
+    )
+
+    # Single projection, packed once (D2-style, no cat): should be tiny.
+    packed_k_nd = [
+        torch_npu.npu_format_cast(pk, ACL_FORMAT_ND) for pk in packed_k
+    ]
+    scale_k_bf16 = [scales[l][0].to(torch.bfloat16) for l in range(D)]
+    out_single = torch_npu.npu_weight_quant_batchmatmul(
+        x[:T],
+        packed_k_nd[0],
+        antiquant_scale=scale_k_bf16[0],
+        antiquant_group_size=0,
+    )
+    ref_single = (
+        x[:T].float()
+        @ (
+            w_ints[0][0].float()
+            * scale_k_bf16[0].float().unsqueeze(1)
+        ).t()
+    )
+    err_single = (out_single.float() - ref_single).abs().max().item()
+    _diag(
+        "single projection wqb (no cat) vs fp32 ref",
+        err_single <= TOLERANCE_FP32,
+        f"err={err_single:.4f}",
+    )
+
+    # Fused K+V packed in ONE call (no cat-of-packs): isolates the cat.
+    fused_packed = _pack_int4(fused_int_0)
+    fused_packed_nd = torch_npu.npu_format_cast(fused_packed, ACL_FORMAT_ND)
+    out_fused1 = torch_npu.npu_weight_quant_batchmatmul(
+        x[:T],
+        fused_packed_nd,
+        antiquant_scale=scale_2d_bf16[0],
+        antiquant_group_size=0,
+    )
+    ref_fused0 = _ref_projection(x, w_ints, scales)[0]
+    err_fused1 = (out_fused1.float() - ref_fused0).abs().max().item()
+    _diag(
+        "fused single-pack wqb vs fp32 ref",
+        err_fused1 <= TOLERANCE_FP32,
+        f"err={err_fused1:.4f}",
+    )
+    print("-" * 60)
+
     ref_wqb = _wqb_fallback(x, w_cat_nd, scale_2d_bf16)
     offset_3d = [
         torch.zeros((D, OUT_N), dtype=torch.bfloat16, device=device)
