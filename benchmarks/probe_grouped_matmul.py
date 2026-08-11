@@ -209,7 +209,9 @@ def _ref_w8a8(x: torch.Tensor, w8_ints, scale_2d) -> torch.Tensor:
             * scale.unsqueeze(0)
             * s_l
         )
-    return torch.stack(refs, dim=0)
+    # The ops output BF16; round the reference so err_fp32 excludes output
+    # quantization (on ~16k-magnitude outputs that alone is ~64).
+    return torch.stack(refs, dim=0).to(torch.bfloat16).float()
 
 
 def _make_variants(
