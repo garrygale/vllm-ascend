@@ -83,7 +83,9 @@ def _check_correctness(device) -> None:
 
     max_err = 0.0
     for i in range(N_SPEC):
-        wc_i = w_fc_t[:, idx[:, i]]  # [HM, b, K]
+        wc_i = torch.index_select(
+            w_fc_t, 1, idx[:, i].reshape(-1)
+        ).view(HM, b, K)  # [HM, b, K]
         corr_k = torch.einsum(
             "bm,bmk->bk", x_corr, wc_i.permute(1, 0, 2)
         )
@@ -148,7 +150,9 @@ def main() -> None:
             vals, idx = torch.topk(base, k, dim=-1)
             base_buf.fill_(float("-inf"))
             for i in range(N_SPEC):
-                wc_i = w_fc_t[:, idx[:, i]]  # [HM, b, K]
+                wc_i = torch.index_select(
+                    w_fc_t, 1, idx[:, i].reshape(-1)
+                ).view(HM, b, K)  # [HM, b, K]
                 corr_k = torch.einsum(
                     "bm,bmk->bk", x_corr, wc_i.permute(1, 0, 2)
                 )
