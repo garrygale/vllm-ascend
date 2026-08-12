@@ -16,7 +16,6 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
 )
 
-from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 
 logger = logging.getLogger(__name__)
@@ -25,35 +24,20 @@ logger = logging.getLogger(__name__)
 class AscendDFlashSpeculator(DFlashSpeculator):
     # NOTE: upstream vLLM named this to _build_draft_attn_metadatas;
     # keep the current name for now as upstream may change it again.
-    # The signature is split on vllm_version_is: v0.26.0's
-    # _build_draft_attn_metadata does not accept seq_lens_cpu_upper_bound /
-    # step; d02df748bf+ does.
-    if vllm_version_is("0.26.0"):
-
-        def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
-            num_tokens_padded = num_reqs_padded * self.num_query_per_req
-            with build_attn_metadata_wrapper():
-                attn_metadata = self._build_draft_attn_metadata(
-                    num_reqs=self.input_batch.num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    num_tokens_padded=num_tokens_padded,
-                    causal=self._group_causal,
-                )
-            return [attn_metadata]
-    else:
-
-        def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
-            num_tokens_padded = num_reqs_padded * self.num_query_per_req
-            with build_attn_metadata_wrapper():
-                attn_metadata = self._build_draft_attn_metadata(
-                    num_reqs=self.input_batch.num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    num_tokens_padded=num_tokens_padded,
-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                    step=self.num_query_per_req,
-                    causal=self._group_causal,
-                )
-            return [attn_metadata]
+    # vLLM 0.26.0's DFlashSpeculator._build_draft_attn_metadata does not
+    # accept seq_lens_cpu_upper_bound / step. Keep this on the 0.26
+    # signature unconditionally (same as the Domino speculator); the extra
+    # argument is accepted by the caller but intentionally unused.
+    def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        num_tokens_padded = num_reqs_padded * self.num_query_per_req
+        with build_attn_metadata_wrapper():
+            attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=self.input_batch.num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                causal=self._group_causal,
+            )
+        return [attn_metadata]
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
