@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from typing import Any, cast
 
 import torch
@@ -107,8 +106,6 @@ class AscendDominoSpeculator(DominoSpeculator):
         still produces full logits through the aclnn fc2 matmul, so sampling
         (Gumbel/top-k/top-p) is unaffected.
         """
-        self._log_triton_status("active")
-
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -167,25 +164,6 @@ class AscendDominoSpeculator(DominoSpeculator):
                     draft_i, gru_hidden, gh
                 )
 
-        self._maybe_log_draft_tokens(num_reqs, "triton")
-
-    def _log_triton_status(self, status: str) -> None:
-        if getattr(self, "_domino_triton_status_logged", False):
-            return
-        print(f"[AscendDomino] triton GRU in speculator: {status}", flush=True)
-        self._domino_triton_status_logged = True
-
-    def _maybe_log_draft_tokens(self, num_reqs: int, path: str) -> None:
-        if (
-            os.environ.get("VLLM_ASCEND_DOMINO_TRITON_DEBUG", "0") != "1"
-            # tolist() is a host sync and is forbidden during ACL graph capture.
-            or torch.npu.is_current_stream_capturing()
-        ):
-            return
-        n_spec = self.num_speculative_steps
-        tokens = self.draft_tokens[0, :n_spec].tolist()
-        print(f"[AscendDomino] {path} draft tokens (first req): {tokens}",
-              flush=True)
 
     def propose(
         self,
