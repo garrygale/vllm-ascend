@@ -141,3 +141,128 @@ def domino_gru_cell_triton(
         BLOCK_G=block_g,
     )
     return h_out.unsqueeze(0)
+
+
+@triton.jit
+def _fused_gru_cell_gather_kernel(
+    gi_table_ptr,
+    tokens_ptr,
+    gh_ptr,
+    h_ptr,
+    h_out_ptr,
+    B,
+    G,
+    stride_tok,
+    stride_gh_b,
+    stride_gh_g,
+    stride_h_b,
+    stride_h_g,
+    stride_hout_b,
+    stride_hout_g,
+    BLOCK_G: tl.constexpr,
+):
+    """GRU cell with the ``gi_table[token]`` gather fused in.
+
+    Same math as ``_fused_gru_cell_kernel``; the input projection rows are
+    loaded directly from the full-vocab ``gi_table`` using the sampled
+    token ids, avoiding the separate ``[B, 3G]`` gather round trip.
+    """
+    pid_b = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    offs_g = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+    mask_g = offs_g < G
+
+    token = tl.load(tokens_ptr + pid_b * stride_tok)
+    gi_base = token * (3 * G)
+
+    h_state = tl.load(
+        h_ptr + pid_b * stride_h_b + offs_g * stride_h_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gi_r = tl.load(
+        gi_table_ptr + gi_base + offs_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gi_z = tl.load(
+        gi_table_ptr + gi_base + G + offs_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gi_n = tl.load(
+        gi_table_ptr + gi_base + 2 * G + offs_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gh_r = tl.load(
+        gh_ptr + pid_b * stride_gh_b + offs_g * stride_gh_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gh_z = tl.load(
+        gh_ptr + pid_b * stride_gh_b + (G + offs_g) * stride_gh_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+    gh_n = tl.load(
+        gh_ptr + pid_b * stride_gh_b + (2 * G + offs_g) * stride_gh_g,
+        mask=mask_g,
+        care_padding=False,
+    )
+
+    r = tl.sigmoid(gi_r + gh_r)
+    z = tl.sigmoid(gi_z + gh_z)
+    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n)) - 1.0
+    h_new = (1.0 - z) * n + z * h_state
+    tl.store(
+        h_out_ptr + pid_b * stride_hout_b + offs_g * stride_hout_g,
+        h_new.to(h_ptr.dtype.element_ty),
+        mask=mask_g,
+    )
+
+
+def domino_gru_cell_triton_gather(
+    gi_table: torch.Tensor,
+    token_ids: torch.Tensor,
+    gh: torch.Tensor,
+    h: torch.Tensor,
+    h_out: torch.Tensor | None = None,
+    block_g: int = 256,
+) -> torch.Tensor:
+    """Fused table-gather + one Triton GRU step.
+
+    Args:
+        gi_table: ``[V, 3G]`` precomputed input-projection table.
+        token_ids: ``[B]`` sampled tokens (rows into ``gi_table``).
+        gh: ``[B, 3G]`` hidden projection (shared with the correction head).
+        h: ``[1, B, G]`` current hidden state.
+        h_out: optional preallocated ``[B, G]`` output buffer.
+        block_g: Triton BLOCK_G.
+
+    Returns:
+        ``[1, B, G]`` new hidden state in ``h``'s dtype.
+    """
+    B = token_ids.shape[0]
+    G = h.shape[-1]
+    if h_out is None:
+        h_out = torch.empty(B, G, dtype=h.dtype, device=h.device)
+    grid = (B, triton.cdiv(G, block_g))
+    _fused_gru_cell_gather_kernel[grid](
+        gi_table,
+        token_ids,
+        gh,
+        h[0],
+        h_out,
+        B,
+        G,
+        token_ids.stride(0),
+        gh.stride(0),
+        gh.stride(1),
+        h[0].stride(0),
+        h[0].stride(1),
+        h_out.stride(0),
+        h_out.stride(1),
+        BLOCK_G=block_g,
+    )
+    return h_out.unsqueeze(0)
