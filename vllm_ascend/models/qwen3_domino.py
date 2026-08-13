@@ -14,8 +14,7 @@ from vllm.distributed import (
 from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
-    domino_gru_cell_triton_gather,
-    domino_zsilu,
+    domino_gru_cell_triton,
 )
 from vllm_ascend.quantization.domino import (
     build_quantized_fused_norm_quant,
@@ -176,9 +175,8 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         for t in range(token_ids.shape[1]):
             sh = F.linear(h[0], self._domino_w_sh)
             gh = sh[:, self.model.emb_dim:]
-            h = domino_gru_cell_triton_gather(
-                self._domino_gi_table, token_ids[:, t], gh, h
-            )
+            gi = self._domino_gi_table[token_ids[:, t]]
+            h = domino_gru_cell_triton(gi, gh, h)
         return h
 
     def domino_optimized_bias_and_gh(
@@ -195,7 +193,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
         s_proj = sh[:, : self.model.emb_dim]
         gh = sh[:, self.model.emb_dim:]
-        x = domino_zsilu(z_part_i, s_proj)
+        x = F.silu(z_part_i + s_proj)
         bias = self.logits_processor(self.model.embed_proj[2], x)
         return bias, gh
 
@@ -207,6 +205,5 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     ) -> torch.Tensor:
         """Table-cell step with a precomputed ``gh``."""
         self._ensure_domino_triton_gru()
-        return domino_gru_cell_triton_gather(
-            self._domino_gi_table, token_ids, gh, h
-        )
+        gi = self._domino_gi_table[token_ids]
+        return domino_gru_cell_triton(gi, gh, h)
