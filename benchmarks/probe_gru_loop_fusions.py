@@ -21,7 +21,14 @@ feasible fusion combination at B = 32 / 64:
     limit; a FAIL row is informative.
 
 Variants are the individual fusions and all meaningful combinations.
-The per-step kernel count and us/step are printed per variant.
+The per-step kernel count and us/step are printed per variant.  Every
+variant is also checked for correctness against the baseline:
+
+  * unit checks: ``zsilu`` vs ``F.silu(z+s)`` (max diff, bf16 mismatch,
+    downstream argmax flips) and fused ``gather_cell`` vs
+    ``cell(table[token])`` (must be bit-identical),
+  * loop trace: per-step draft-token equality and final hidden-state
+    max diff vs the baseline loop (eager, no graph).
 
 Run directly on an NPU:
     python benchmarks/probe_gru_loop_fusions.py
@@ -335,6 +342,58 @@ def _capture_replay_time(fn, iters: int = ITERS, warmup: int = WARMUP):
     return (time.perf_counter() - t0) / iters * 1e3
 
 
+def _trace_loop(step_fn, b: int, device: str, draft_tokens: torch.Tensor):
+    """Run the 15-step loop eagerly, recording hidden states per step."""
+    h = torch.zeros(1, b, G, dtype=DTYPE, device=device)
+    hs = [h.clone()]
+    for i in range(N_SPEC):
+        h = step_fn(i, h)
+        hs.append(h.clone())
+    return draft_tokens.clone(), hs
+
+
+def _unit_checks(b: int, device: str, table, w_emb2, base_logits):
+    """Direct op-level checks for the two integrated fusions."""
+    print(f"B={b}: unit checks (fused vs reference):")
+
+    z = torch.randn(b, M, dtype=DTYPE, device=device) * 0.05
+    s = torch.randn(b, M, dtype=DTYPE, device=device) * 0.05
+    x_fused = torch.empty(b, M, dtype=DTYPE, device=device)
+    _zsilu_kernel[(b,)](z, s, x_fused, M, BLOCK_M=M, multibuffer=False)
+    x_ref = F.silu(z + s)
+    diff = (x_fused.float() - x_ref.float()).abs().max().item()
+    mism = (x_fused != x_ref).sum().item()
+    tok_f = (base_logits[:, 0] + F.linear(x_fused, w_emb2)).argmax(dim=-1)
+    tok_r = (base_logits[:, 0] + F.linear(x_ref, w_emb2)).argmax(dim=-1)
+    flips = (tok_f != tok_r).sum().item()
+    print(
+        f"  zsilu:            max_diff={diff:.6f} "
+        f"bf16_mismatch={mism}/{b * M} argmax_flips={flips}/{b}",
+        flush=True,
+    )
+
+    tokens = torch.randint(0, V, (b,), dtype=torch.int64, device=device)
+    gh = torch.randn(b, 3 * G, dtype=DTYPE, device=device) * 0.02
+    h = torch.randn(1, b, G, dtype=DTYPE, device=device) * 0.02
+    h_out = torch.empty(b, G, dtype=DTYPE, device=device)
+    _cell_gather_kernel[(b, triton.cdiv(G, 256))](
+        table, tokens, gh, h[0], h_out,
+        b, G,
+        1, gh.stride(0), gh.stride(1), h[0].stride(0), h[0].stride(1),
+        h_out.stride(0), h_out.stride(1),
+        BLOCK_G=256,
+    )
+    h_fused = h_out.unsqueeze(0)
+    h_ref = domino_gru_cell_triton(table[tokens], gh, h)
+    diff = (h_fused.float() - h_ref.float()).abs().max().item()
+    mism = (h_fused != h_ref).sum().item()
+    print(
+        f"  gather_cell:      max_diff={diff:.6f} "
+        f"bf16_mismatch={mism}/{b * G}",
+        flush=True,
+    )
+
+
 VARIANTS = [
     ("baseline", {}),
     ("zsilu", {"zsilu": True}),
@@ -379,7 +438,10 @@ def main() -> None:
 
         print("-" * 78)
         print(f"B={b}: full 15-step loop, graph replay:")
+        _unit_checks(b, device, table, w_emb2, base_logits)
         baseline_us = None
+        baseline_tokens = None
+        baseline_hs = None
         results = []
         for name, flags in VARIANTS:
             step = _make_step(
@@ -395,18 +457,50 @@ def main() -> None:
             try:
                 ms = _capture_replay_time(loop)
                 us = ms * 1e3
+                toks, hs = _trace_loop(step, b, device, draft_tokens)
+                tok_mism = -1
+                first_div = -1
+                h_diff = -1.0
                 if baseline_us is None:
                     baseline_us = us
-                results.append((name, us, True, ""))
+                    baseline_tokens = toks
+                    baseline_hs = hs
+                else:
+                    tok_mism = int((toks != baseline_tokens).sum().item())
+                    first_div = next(
+                        (
+                            i
+                            for i in range(N_SPEC)
+                            if not torch.equal(toks[:, i], baseline_tokens[:, i])
+                        ),
+                        -1,
+                    )
+                    h_diff = max(
+                        (
+                            a.float() - b.float()
+                        ).abs().max().item()
+                        for a, b in zip(hs, baseline_hs)
+                    )
+                results.append(
+                    (name, us, True, "", tok_mism, first_div, h_diff)
+                )
             except Exception as exc:  # noqa: BLE001
-                results.append((name, float("nan"), False, str(exc)[:120]))
+                results.append(
+                    (name, float("nan"), False, str(exc)[:120],
+                     -1, -1, -1.0)
+                )
 
-        for name, us, ok, err in results:
+        for name, us, ok, err, tok_mism, first_div, h_diff in results:
             if ok:
                 delta = (us / baseline_us - 1.0) * 100 if baseline_us else 0.0
+                tok_str = "-" if tok_mism < 0 else str(tok_mism)
+                first_str = "-" if first_div < 0 else str(first_div)
+                h_str = "-" if h_diff < 0 else f"{h_diff:.6f}"
                 print(
                     f"  {name:34s} {us:9.2f} us/step "
-                    f"({delta:+6.1f}% vs baseline)",
+                    f"({delta:+6.1f}% vs baseline) "
+                    f"tok_mism={tok_str} first_div={first_str} "
+                    f"h_diff={h_str}",
                     flush=True,
                 )
             else:
