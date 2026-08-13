@@ -25,7 +25,6 @@ from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -759,13 +758,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
-        if self.method in ("eagle3", "dflash", "dspark", "domino"):
+        if self.method in ("eagle3", "dflash", "dspark"):
             assert isinstance(
                 self.get_model(),
                 (
                     Eagle3LlamaForCausalLM,
                     DFlashQwen3ForCausalLM,
-                    Qwen3DominoForCausalLM,
                     Qwen3DSparkForCausalLM,
                     Eagle3VwnLlamaForCausalLM,
                     Eagle3DeepseekV2ForCausalLM,
@@ -1151,48 +1149,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         logits_bias = self.model.markov_bias(markov_emb)
                         logits[:, idx].add_(logits_bias)
                         draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
-            elif self.method == "domino":
-                # Domino: anchor-first block + triton-table GRU correction.
-                # ``sample_hidden_states`` has been all-gathered to full.
-                with _disable_flash_comm_v1_context():
-                    raw_logits = self.model.compute_draft_logits(sample_hidden_states)
-                    logits = raw_logits.view(
-                        -1, self.num_speculative_tokens, raw_logits.shape[-1]
-                    )
-                    num_blk = logits.shape[0]
-                    draft_token_ids = self._domino_draft_buffer[:num_blk]
-                    prefix_len = int(
-                        getattr(self.model, "pure_draft_prefix_len", 0)
-                    )
-                    prefix_ids = torch.empty(
-                        num_blk,
-                        1 + prefix_len,
-                        dtype=torch.int64,
-                        device=self.device,
-                    )
-                    prefix_ids[:, 0] = self._domino_anchor_buffer[:num_blk]
-                    for idx in range(prefix_len):
-                        draft_token_ids[:, idx + 1].copy_(
-                            logits[:, idx].argmax(dim=-1)
-                        )
-                        prefix_ids[:, 1 + idx] = draft_token_ids[:, idx + 1]
-                    gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
-                    sample_hidden_3d = sample_hidden_states.view(
-                        num_blk, self.num_speculative_tokens, -1
-                    )
-                    z_part = self.model.domino_z_part(sample_hidden_3d)
-                    for idx in range(prefix_len, self.num_speculative_tokens):
-                        bias, gh = self.model.domino_optimized_bias_and_gh(
-                            gru_hidden, z_part[:, idx]
-                        )
-                        logits[:, idx].add_(bias)
-                        draft_token_ids[:, idx + 1].copy_(
-                            logits[:, idx].argmax(dim=-1)
-                        )
-                        if idx + 1 < self.num_speculative_tokens:
-                            gru_hidden = self.model.domino_optimized_cell(
-                                draft_token_ids[:, idx + 1], gru_hidden, gh
-                            )
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
@@ -1207,7 +1163,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            if self.method in ("dspark", "domino"):
+            if self.method == "dspark":
                 return draft_token_ids[:, 1:]
             else:
                 # [batch_size, 1]
