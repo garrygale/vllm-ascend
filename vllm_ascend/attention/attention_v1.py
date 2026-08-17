@@ -69,6 +69,15 @@ SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
 
 
+def _draft_attn_key_layer_index(key: str) -> int:
+    """Layer index of a draft attention metadata key
+    (e.g. "model.layers.36.self_attn.attn")."""
+    import re
+
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", key)
+    return int(match.group(1)) if match else 0
+
+
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -323,8 +332,20 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         attn_state = common_attn_metadata.attn_state
 
-        # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
+        # Get attn_mask from singleton AttentionMaskBuilder.  FIA band mode
+        # (sparse_mode=4, used by non-causal sliding layers) requires a
+        # 2048x2048 mask tensor even though the pre/next band decides the
+        # attended range; pass a non-masking (all-zero) mask for those
+        # layers (the causal mask would wrongly hide future positions).
+        if (
+            not common_attn_metadata.causal
+            and getattr(self.kv_cache_spec, "sliding_window", None) is not None
+        ):
+            attn_mask = self.attn_mask_builder.get_band_attn_mask()
+        else:
+            attn_mask = self.attn_mask_builder.get_attention_mask(
+                common_attn_metadata.causal, self.model_config
+            )
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -547,6 +568,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     for draft_step, per_step_metadata in enumerate(attn_metadata)
                     for key in per_step_metadata
                 ]
+                # The metadata dict is keyed in kv-cache-group order, which
+                # for multi-group drafters (e.g. Domino with per-layer
+                # sliding windows) no longer matches the layer execution
+                # order of the captured params.  Reorder by layer index so
+                # the positional replay pairing stays correct.
+                draft_attn_key_steps.sort(
+                    key=lambda step_key: (
+                        step_key[0],
+                        _draft_attn_key_layer_index(step_key[1]),
+                    )
+                )
                 attn_keys = [key for _, key in draft_attn_key_steps]
             else:
                 graph_params = get_graph_params()
@@ -608,15 +640,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
                     if _EXTRA_CTX.is_draft_model:
                         draft_step, key = draft_attn_key_steps[attn_count]
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
+                        metadata = attn_metadata[draft_step][key]
+                        seq_lens = metadata.seq_lens_list
+                        actual_seq_lengths_q = metadata.actual_seq_lengths_q
                         attn_count = attn_count + 1
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
-                        seq_lens = attn_metadata[metadata_key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
+                        metadata = attn_metadata[metadata_key]
+                        seq_lens = metadata.seq_lens_list
+                        actual_seq_lengths_q = metadata.actual_seq_lengths_q
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
+                    # Non-causal sliding layers attend bidirectionally
+                    # within the window.
+                    next_tokens = (
+                        sliding_window
+                        if sliding_window is not None and not metadata.causal
+                        else 0
+                    )
                     torch_npu.npu_fused_infer_attention_score_v2.out(
                         query=query,
                         key=key_cache,
@@ -631,7 +672,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_query_heads=num_heads,
                         sparse_mode=4 if sliding_window is not None else 3,
                         pre_tokens=sliding_window if sliding_window is not None else SWA_INT_MAX,
-                        next_tokens=0,
+                        next_tokens=next_tokens,
                         softmax_scale=scale,
                         learnable_sink=sinks,
                         workspace=workspace,
@@ -652,6 +693,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     for draft_step, per_step_metadata in enumerate(attn_metadata)
                     for key in per_step_metadata
                 ]
+                # The metadata dict is keyed in kv-cache-group order, which
+                # for multi-group drafters (e.g. Domino with per-layer
+                # sliding windows) no longer matches the layer execution
+                # order of the captured params.  Reorder by layer index so
+                # the positional replay pairing stays correct.
+                draft_attn_key_steps.sort(
+                    key=lambda step_key: (
+                        step_key[0],
+                        _draft_attn_key_layer_index(step_key[1]),
+                    )
+                )
                 attn_keys = [key for _, key in draft_attn_key_steps]
             else:
                 graph_params = get_graph_params()
@@ -786,7 +838,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         block_tables = metadata.block_tables
                         attn_count = attn_count + 1
                         if not metadata.causal:
-                            sparse_mode = 0
+                            # Full-attention layers use the captured
+                            # bidirectional mode; sliding-window layers
+                            # keep the captured symmetric band.
+                            if pre_tokens == SWA_INT_MAX:
+                                sparse_mode = 0
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
                         seq_lens = attn_metadata[metadata_key].seq_lens_list
@@ -868,7 +924,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_mask = attn_metadata.attn_mask
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window or SWA_INT_MAX
-        next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+        # Non-causal sliding layers (e.g. the Domino SWA draft) attend
+        # bidirectionally within the window.
+        next_tokens = (
+            self.sliding_window
+            if self.sliding_window is not None and not attn_metadata.causal
+            else (0 if self.sliding_window else SWA_INT_MAX)
+        )
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
@@ -1327,7 +1389,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
-            if not attn_metadata.causal:
+            if not attn_metadata.causal and self.sliding_window is not None:
+                # Non-causal sliding window (e.g. the Domino SWA draft
+                # layers): a symmetric band.  ``pre_tokens`` follows the
+                # causal SWA branch's convention.
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    query=query,
+                    key=key,
+                    value=value,
+                    atten_mask=attn_metadata.attn_mask,
+                    block_table=block_table,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    pre_tokens=self.sliding_window,
+                    next_tokens=self.sliding_window,
+                    sparse_mode=4,
+                )
+            elif not attn_metadata.causal:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,

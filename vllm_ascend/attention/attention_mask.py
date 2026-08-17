@@ -38,6 +38,7 @@ class AttentionMaskBuilder:
         self.device = device
         self.mla_mask = None
         self.chunked_prefill_attn_mask = None
+        self.band_attn_mask = None
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype):
         if self.attn_mask_cache is None or max_seq_len > self._seq_len_cached:
@@ -54,6 +55,22 @@ class AttentionMaskBuilder:
                 torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
             )
         return self.chunked_prefill_attn_mask
+
+    def get_band_attn_mask(self) -> torch.Tensor:
+        """Non-masking 2048x2048 mask for FIA band mode (sparse_mode=4).
+
+        FIA requires an ``attenMask`` tensor for band mode even though the
+        ``preTokens``/``nextTokens`` band decides the attended range.  The
+        causal split-fuse mask would wrongly hide the future positions of a
+        non-causal sliding band, so use an all-zero mask (1 = masked; all
+        zeros mask nothing; an all-zero matrix is trivially lower-
+        triangular, satisfying the mask constraint).
+        """
+        if self.band_attn_mask is None:
+            self.band_attn_mask = torch.zeros(
+                (2048, 2048), dtype=torch.int8, device=self.device
+            )
+        return self.band_attn_mask
 
     def get_mla_mask(self, dtype: torch.dtype) -> torch.Tensor:
         if self.mla_mask is None or self.mla_mask.dtype != dtype:
