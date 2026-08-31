@@ -16,7 +16,9 @@ Aggregate statistics are computed from metric snapshots around the whole run.
 Edit the CONFIG block below, then run:
     python benchmarks/check_acceptance_service.py
 
-Datasets: humaneval (JSONL with ``prompt``) or gsm8k (JSONL with ``question``).
+Datasets: humaneval (JSONL with ``prompt``), gsm8k (JSONL with ``question``),
+math500 (JSONL with ``problem``), mbpp (JSON array with ``prompt`` and
+``test_list``), or oasst (JSONL with ``prompt``).
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ TEMPERATURE = 0.0
 TOP_P = 1.0
 TOP_K = 0
 
-DATASET = "gsm8k"  # "humaneval" or "gsm8k"
+DATASET = "gsm8k"  # "humaneval", "gsm8k", "math500", "mbpp" or "oasst"
 DATASET_PATH = "/path/to/gsm8k_test.jsonl"
 
 MAX_TOKENS = 1024          # generation upper bound; EOS stops earlier
@@ -63,8 +65,30 @@ METRICS_SETTLE_SECONDS = 0.2  # allow counters to flush before reading
 # ---------------------------------------------------------------------------
 
 
+def build_mbpp_prompt(text: str, test_list: list) -> str:
+    """Standard MBPP prompt format used in the original paper."""
+    tests = "\n".join(test_list)
+    return (
+        "You are an expert Python programmer, and here is your task: "
+        f"{text} Your code should pass these tests:\n\n{tests}\n\n[BEGIN]\n"
+    )
+
+
 def load_prompts(path: str, dataset: str) -> list[tuple[str, str]]:
-    """Return ``[(task_id, prompt), ...]`` from a JSONL dataset."""
+    """Return ``[(task_id, prompt), ...]`` from a dataset file."""
+    if dataset == "mbpp":
+        with open(path, encoding="utf-8") as f:
+            items = json.load(f)
+        rows = []
+        for idx, item in enumerate(items):
+            text = item.get("prompt") or item.get("text") or ""
+            test_list = item.get("test_list") or []
+            task_id = item.get("task_id", idx)
+            rows.append(
+                (f"mbpp_{task_id}", build_mbpp_prompt(text, test_list))
+            )
+        return rows
+
     rows = []
     with open(path, encoding="utf-8") as f:
         for idx, line in enumerate(f):
@@ -76,6 +100,11 @@ def load_prompts(path: str, dataset: str) -> list[tuple[str, str]]:
                 rows.append((item["task_id"], item["prompt"]))
             elif dataset == "gsm8k":
                 rows.append((f"gsm8k_{idx}", item["question"]))
+            elif dataset == "oasst":
+                rows.append((f"oasst_{idx}", item["prompt"]))
+            elif dataset == "math500":
+                task_id = item.get("unique_id") or f"math500_{idx}"
+                rows.append((task_id, item["problem"]))
             else:
                 raise ValueError(f"unknown dataset: {dataset}")
     return rows
@@ -198,7 +227,11 @@ def send_completion(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument(
+        "--dataset",
+        default=DATASET,
+        choices=["humaneval", "gsm8k", "oasst", "math500", "mbpp"],
+    )
     parser.add_argument("--dataset-path", default=DATASET_PATH)
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     parser.add_argument("--num-prompts", type=int, default=NUM_PROMPTS)
