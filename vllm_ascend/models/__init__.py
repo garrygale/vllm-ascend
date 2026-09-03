@@ -32,3 +32,7 @@ def register_model():
         "Qwen3DominoModel",
         "vllm_ascend.models.qwen3_domino:AscendQwen3DominoForCausalLM",
     )
+    ModelRegistry.register_model(
+        "DominoDraftModel",
+        "vllm_ascend.models.qwen3_domino:AscendQwen3DominoForCausalLM",
+    )

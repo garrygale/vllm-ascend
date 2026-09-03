@@ -16,6 +16,10 @@ else:
 
 def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
     initial_architecture = hf_config.architectures[0]
+    if initial_architecture == "DominoDraftModel":
+        # SpecForge exports Domino under the training-time architecture name;
+        # vLLM's Domino proposal uses the Qwen3DominoModel registry entry.
+        hf_config.update({"architectures": ["Qwen3DominoModel"]})
     if initial_architecture == "DSparkDraftModel" and hf_config.model_type == "qwen3":
         # Legacy Qwen3/GQA DSpark checkpoints keep the inference-only fields
         # under dflash_config and use the training-time architecture name.
