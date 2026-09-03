@@ -58,7 +58,8 @@ STORE_PER_SAMPLE = False  # keep per-request rows in the summary JSON
 USE_CHAT_TEMPLATE = True  # send via /v1/chat/completions so the server
                           # applies the model's chat template (matches
                           # specforge's check_acceptance --use-chat-template)
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}  # Qwen3-specific
+CHAT_TEMPLATE_KWARGS = {}  # optional extra chat-template kwargs
+REASONING_EFFORT = "low"  # "none" disables; Qwen3.8 accepts low/medium/xhigh
 REQUEST_TIMEOUT = 600     # seconds per request
 METRICS_SETTLE_SECONDS = 0.2  # allow counters to flush before reading
 
@@ -192,6 +193,7 @@ def send_completion(
     top_k: int,
     use_chat_template: bool,
     chat_template_kwargs: dict,
+    reasoning_effort: str | None,
 ) -> int:
     """POST /v1/completions and return the number of completion tokens."""
     if use_chat_template:
@@ -204,8 +206,13 @@ def send_completion(
             "top_p": top_p,
             "top_k": top_k,
             "stream": False,
-            "chat_template_kwargs": chat_template_kwargs,
         }
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
+        if reasoning_effort is not None:
+            # vLLM maps this to enable_thinking=(reasoning_effort != "none")
+            # and forwards it to the chat template as reasoning_effort.
+            payload["reasoning_effort"] = reasoning_effort
     else:
         endpoint = "/v1/completions"
         payload = {
@@ -255,6 +262,12 @@ def main() -> None:
         help="send via /v1/chat/completions so the server applies the "
         "model's chat template",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=REASONING_EFFORT,
+        help="chat reasoning effort: none/minimal/low/medium/high/xhigh/max "
+        "(Qwen3.8 template accepts low/medium/xhigh)",
+    )
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     args = parser.parse_args()
 
@@ -276,6 +289,8 @@ def main() -> None:
         f"top_p={args.top_p}  top_k={args.top_k}  "
         f"chat_template={args.use_chat_template}"
     )
+    if args.use_chat_template:
+        print(f"Reasoning effort: {args.reasoning_effort}")
     print(f"Dataset: {args.dataset} ({len(prompts)} prompts)")
 
     before_all = fetch_spec_decode_metrics(base_url)
@@ -316,6 +331,7 @@ def main() -> None:
                 args.top_k,
                 args.use_chat_template,
                 CHAT_TEMPLATE_KWARGS,
+                args.reasoning_effort,
             )
             time.sleep(METRICS_SETTLE_SECONDS)
             after = fetch_spec_decode_metrics(base_url)
@@ -391,6 +407,7 @@ def main() -> None:
                     args.top_k,
                     args.use_chat_template,
                     CHAT_TEMPLATE_KWARGS,
+                    args.reasoning_effort,
                 )
                 with print_lock:
                     print(f"[w{worker_id}] [{idx}/{len(prompts)}] {task_id}")
@@ -427,6 +444,9 @@ def main() -> None:
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "reasoning_effort": (
+            args.reasoning_effort if args.use_chat_template else None
+        ),
         "dataset": args.dataset,
         "num_requests": len(prompts),
         "num_workers": args.num_workers,
