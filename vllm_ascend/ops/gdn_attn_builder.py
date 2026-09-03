@@ -594,9 +594,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_query_lens = torch.diff(spec_query_start_loc).to(
                 num_accepted_tokens.dtype
             )
-            num_accepted_tokens = num_accepted_tokens.clamp(
-                min=1,
-                max=spec_query_lens,
+            # PyTorch rejects mixing a scalar min with a tensor max in clamp().
+            # Apply the lower bound first, then cap each row by its own
+            # segment length.
+            num_accepted_tokens = torch.minimum(
+                num_accepted_tokens.clamp(min=1),
+                spec_query_lens,
             )
 
         chunk_indices: torch.Tensor | None = None
