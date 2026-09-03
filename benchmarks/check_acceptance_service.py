@@ -58,7 +58,7 @@ STORE_PER_SAMPLE = False  # keep per-request rows in the summary JSON
 USE_CHAT_TEMPLATE = True  # send via /v1/chat/completions so the server
                           # applies the model's chat template (matches
                           # specforge's check_acceptance --use-chat-template)
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}  # Qwen3-specific
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": True}  # Qwen3.6-style template
 REQUEST_TIMEOUT = 600     # seconds per request
 METRICS_SETTLE_SECONDS = 0.2  # allow counters to flush before reading
 
