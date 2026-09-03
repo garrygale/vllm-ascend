@@ -586,6 +586,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 spec_sequence_indices,
             )
+            # num_accepted_tokens includes the bonus token (1 + accepted draft
+            # tokens). A truncated final round can therefore exceed the row's
+            # actual varlen segment length even when every scheduled token is
+            # accepted; the custom recurrent/conv ops reject accepted > seqLen.
+            # Clamp active rows to their segment length before the op sees them.
+            spec_query_lens = torch.diff(spec_query_start_loc).to(
+                num_accepted_tokens.dtype
+            )
+            num_accepted_tokens = num_accepted_tokens.clamp(
+                min=1,
+                max=spec_query_lens,
+            )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
