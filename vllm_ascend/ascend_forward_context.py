@@ -6,7 +6,6 @@ from enum import Enum
 from typing import Any
 
 import torch
-import vllm.envs as envs_vllm
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
@@ -448,19 +447,22 @@ class _ExtraForwardContextProxy:
     def __getattr__(self, name: str) -> Any:
         self.check_extra_attr(name)
         ctx = self._ctx()
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            # Unset known extras default to None so optional flags (e.g. `sinks`)
-            # can be read with truthiness checks before the V2 path populates them.
-            return ctx.additional_kwargs.get(name)
+        # V2 stores extra context in ``additional_kwargs``, while V1 attaches
+        # the same fields directly to the ForwardContext object.  Do not use
+        # VLLM_USE_V2_MODEL_RUNNER to decide: Domino forces the V2 runner even
+        # when that environment variable is unset, so env-based dispatch would
+        # return None for fields that V2 actually populated.
+        if name in ctx.additional_kwargs:
+            return ctx.additional_kwargs[name]
         return getattr(ctx, name, None)
 
     def __setattr__(self, name: str, value: Any) -> None:
         self.check_extra_attr(name)
         ctx = self._ctx()
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            ctx.additional_kwargs[name] = value
-        else:
-            setattr(ctx, name, value)
+        # Keep both storage locations in sync: V1 reads the direct attribute
+        # (and may create it), while V2 reads/advertises additional_kwargs.
+        ctx.additional_kwargs[name] = value
+        setattr(ctx, name, value)
 
 
 # usage: from vllm_ascend.ascend_forward_context import _EXTRA_CTX
