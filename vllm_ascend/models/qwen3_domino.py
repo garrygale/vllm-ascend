@@ -56,8 +56,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         )
 
         # On-the-fly per-channel quantization driven by the draft config
-        # (dflash_config.qat_*): qat_w_bit=8 selects W8A8 for every draft
-        # linear; any other value (or no qat_w_bit) keeps bf16 with a warning.
+        # (dflash_config.qat_*): qat_w_bit selects the W4A8/W8A8 bulk scheme
+        # and qat_w4a4_layers the per-layer W4A4; no qat_w_bit means bf16.
+        # W4A8 (npu_weight_quant_batchmatmul, int4-packed int32) works in both
+        # eager and ACL graph mode, so no eager/graph redirect is needed.
         num_quantized = quantize_domino_model(self.model)
         quant_fused = False
         if num_quantized:

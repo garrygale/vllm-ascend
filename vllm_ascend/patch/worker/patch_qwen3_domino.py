@@ -9,10 +9,10 @@ The vLLM main implementation uses ``ops.rms_norm`` and
 module-based RMSNorm, a per-layer k-norm loop, and the Ascend rotary module
 with a cloned key, mirroring ``patch_qwen3_dflash.py``.
 
-With on-the-fly W8A8 quantization, the fused K/V projection is one
-``npu_grouped_matmul`` call over the per-layer int8 weights (3D weight
-``[D, K, 2N]``, per-layer scales, ``split_item=2``); the fused K+V weights are
-built by ``quantize_domino_model``.
+With on-the-fly W4A8 quantization, the fused K/V projection is one
+``npu_grouped_matmul`` call over the per-layer packed int4 weights (3D weight
+``[D, K, 2N//8]``, per-layer scales/offsets, ``split_item=2``); the packed
+K+V weights are built as a single pack by ``quantize_domino_model``.
 
 Debug env var:
   * ``VLLM_ASCEND_DOMINO_TIMING=1`` prints each precompute's wall time in us
@@ -71,29 +71,53 @@ def _ascend_domino_attention_forward(
     """Domino attention forward with the optional fused quantized qkv.
 
     The fused path is attached by ``build_quantized_fused_qkv`` after
-    on-the-fly W8A8 quantization (one int8 q+k+v projection call per layer).
-    In the norm+quant fusion (``_use_fused_norm_quant``) the layer forward
-    already ran ``npu_add_rms_norm_dynamic_quant`` and passes ``x8``/``x8s``
-    so the projection skips its own activation quant.  The fused projection
-    also feeds
+    on-the-fly quantization (W4A8 single-pack or W4A4 packed q+k+v, one
+    projection call per layer).  In the all-W8A8 norm+quant fusion
+    (``_use_fused_norm_quant``) the layer forward already ran
+    ``npu_add_rms_norm_dynamic_quant`` and passes ``x8``/``x8s`` so the
+    projection skips its own activation quant.  The fused projection also
+    feeds
     ``qkv_rmsnorm_rope``, which applies q/k RMSNorm + RoPE in one kernel
     (probe: ~2x faster than split + two norms + rope).  The bf16 path keeps
     the separate q/k/v linears, since a fused bf16 projection is slower on
     NPU.
     """
     if getattr(self, "_use_fused_qkv", False):
-        if x8 is None or x8s is None:
-            x8, x8s = torch_npu.npu_dynamic_quant(hidden_states)
-            if x8s.dim() == 2:
-                x8s = x8s.squeeze(1)
-        qkv = torch_npu.npu_quant_matmul(
-            x8,
-            self._fused_qkv_weight,
-            self._fused_qkv_scale,
-            pertoken_scale=x8s,
-            bias=None,
-            output_dtype=hidden_states.dtype,
-        )
+        scheme = self._fused_qkv_scheme
+        if scheme == "w4a8":
+            qkv = torch_npu.npu_weight_quant_batchmatmul(
+                hidden_states,
+                self._fused_qkv_weight,
+                antiquant_scale=self._fused_qkv_scale,
+                antiquant_group_size=0,
+            )
+        elif scheme == "w4a4":
+            x4, x4s = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.quint4x2
+            )
+            qkv = torch_npu.npu_quant_matmul(
+                x4,
+                self._fused_qkv_weight,
+                scale=self._fused_qkv_scale.view(-1),
+                pertoken_scale=x4s.reshape(-1),
+                bias=None,
+                output_dtype=torch.float16,
+            ).to(hidden_states.dtype)
+        elif scheme == "w8a8":
+            if x8 is None or x8s is None:
+                x8, x8s = torch_npu.npu_dynamic_quant(hidden_states)
+                if x8s.dim() == 2:
+                    x8s = x8s.squeeze(1)
+            qkv = torch_npu.npu_quant_matmul(
+                x8,
+                self._fused_qkv_weight,
+                self._fused_qkv_scale,
+                pertoken_scale=x8s,
+                bias=None,
+                output_dtype=hidden_states.dtype,
+            )
+        else:
+            raise RuntimeError(f"unknown fused qkv scheme: {scheme}")
         q, k, v = torch.ops.vllm.qkv_rmsnorm_rope(
             input=qkv,
             cos_sin_cache=self._fused_qkv_cos_sin_cache,
@@ -283,13 +307,14 @@ def precompute_and_store_context_kv(
         nkv = self._num_kv_heads
 
         if getattr(self, "_fused_kv_quantized", False):
-            # --- Quantized fused KV projection (one grouped W8A8 GEMM) ---
+            # --- Quantized fused KV projection (one grouped W4A8 GEMM) ---
             # All layers share the same hidden_norm; the [T, D, H] context is
             # flattened to [T*D, H], normalized in one module call, then
-            # projected through the per-layer int8 K/V weights with a single
-            # npu_grouped_matmul (3D weight + group_list, split_item=2).
+            # projected through the per-layer packed int4 K/V weights with a
+            # single npu_grouped_matmul (3D weight + group_list, split_item=2).
             fused_norm_quant = (
                 getattr(self, "_use_fused_norm_quant", False)
+                and self._fused_kv_scheme == "w8a8"
                 and _RNQ_OP is not None
             )
             if fused_norm_quant:
@@ -314,37 +339,49 @@ def precompute_and_store_context_kv(
             group_list = self._fused_kv_group_list
             group_list.fill_(num_ctx)
             group_list.cumsum_(0)
-            # Quantize the shared activation once, then grouped int8 x int8
-            # matmul with per-token and per-channel scales.
-            if fused_norm_quant:
-                x8, x8s = _RNQ_OP(
-                    fused,
-                    getattr(
-                        self,
-                        "_hidden_norm_weight",
-                        self.hidden_norm.weight.data,
-                    ),
-                    epsilon=getattr(
-                        self,
-                        "_hidden_norm_eps",
-                        self.hidden_norm.variance_epsilon,
-                    ),
-                )
-            else:
-                x8, x8s = torch_npu.npu_dynamic_quant(fused)
-            if x8s.dim() == 2:
-                x8s = x8s.squeeze(1)
-            all_kv_flat = torch_npu.npu_grouped_matmul(
-                x=[x8],
-                weight=[self._fused_kv_weight],
-                scale=[self._fused_kv_scale],
-                per_token_scale=[x8s],
-                group_list=group_list,
-                split_item=2,
-                group_type=0,
-                group_list_type=0,
-                output_dtype=torch.bfloat16,
-            )[0]
+            if self._fused_kv_scheme == "w4a8":
+                all_kv_flat = torch_npu.npu_grouped_matmul(
+                    x=[fused],
+                    weight=[self._fused_kv_weight],
+                    antiquant_scale=[self._fused_kv_scale],
+                    antiquant_offset=[self._fused_kv_offset],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=0,
+                    output_dtype=torch.bfloat16,
+                )[0]
+            else:  # w8a8: quantize the shared activation once, then grouped
+                # int8 x int8 matmul with per-token and per-channel scales.
+                if fused_norm_quant:
+                    x8, x8s = _RNQ_OP(
+                        fused,
+                        getattr(
+                            self,
+                            "_hidden_norm_weight",
+                            self.hidden_norm.weight.data,
+                        ),
+                        epsilon=getattr(
+                            self,
+                            "_hidden_norm_eps",
+                            self.hidden_norm.variance_epsilon,
+                        ),
+                    )
+                else:
+                    x8, x8s = torch_npu.npu_dynamic_quant(fused)
+                if x8s.dim() == 2:
+                    x8s = x8s.squeeze(1)
+                all_kv_flat = torch_npu.npu_grouped_matmul(
+                    x=[x8],
+                    weight=[self._fused_kv_weight],
+                    scale=[self._fused_kv_scale],
+                    per_token_scale=[x8s],
+                    group_list=group_list,
+                    split_item=2,
+                    group_type=0,
+                    group_list_type=0,
+                    output_dtype=torch.bfloat16,
+                )[0]
             all_kv_flat = all_kv_flat.contiguous()
         else:
             # --- bf16 fused KV projection (one batched GEMM for all layers) ---
@@ -417,7 +454,7 @@ def precompute_and_store_context_kv(
                 "per-layer"
                 if not getattr(self, "_use_fused_context_kv", False)
                 else (
-                    "fused-w8a8"
+                    "fused-w4a8"
                     if getattr(self, "_fused_kv_quantized", False)
                     else "fused"
                 )
