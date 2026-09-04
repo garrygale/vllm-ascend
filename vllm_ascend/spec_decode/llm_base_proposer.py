@@ -504,7 +504,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.use_eagle,
                 self.enable_enpu,
             )
-            self.update_stream = None
+            self.update_stream = torch.npu.Stream()
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
