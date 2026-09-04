@@ -269,6 +269,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                    if initial_state_mode_opt is not None and cache_indices_opt is not None:
+                        # The recurrent state is explicitly cleared below, but
+                        # causal_conv1d keeps its state in the conv buffer.
+                        # Clear fresh-prefill rows before the conv kernel runs so
+                        # a reused KV block can never leak a previous request's
+                        # conv state into a new sequence.
+                        conv_state = self_kv_cache[0]
+                        if cache_indices_opt.dim() == 2:
+                            # Non-spec prefill conv metadata can carry the full
+                            # block-table row; the conv kernel initial state is
+                            # selected from its first column.
+                            cache_indices_1d = cache_indices_opt[:, 0]
+                        else:
+                            cache_indices_1d = cache_indices_opt
+
+                        indices = cache_indices_1d.reshape(-1).to(torch.int64)
+                        selected_conv = conv_state.index_select(0, indices)
+                        clear_ssm_states(selected_conv, initial_state_mode_opt)
+                        conv_state.index_copy_(0, indices, selected_conv)
+
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,

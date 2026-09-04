@@ -967,7 +967,18 @@ class NPUWorker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        hidden_states, sample_hidden_states = self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        # Keep the sampling phase symmetric across DP ranks. A rank that runs
+        # a dummy batch while another DP rank is doing real sample_tokens must
+        # still execute the same logits/sampler path, otherwise any collective
+        # used by sampling (e.g. fine-grained LM-head TP) waits forever for the
+        # idle rank.
+        if (
+            getattr(self.model_runner, "sampler", None) is not None
+            and sample_hidden_states is not None
+        ):
+            self.model_runner._dummy_sampler_run(sample_hidden_states)
+
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

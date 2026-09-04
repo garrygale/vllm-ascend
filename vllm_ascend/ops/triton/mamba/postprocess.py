@@ -102,12 +102,12 @@ def postprocess_mamba_fused_kernel(
     dest_block_idx = aligned_new_computed // block_size - 1
 
     # Update accepted-token count before early exits (per-request, so only
-    # state_idx == 0 writes). V2 updates in place; V1 writes the _out buffer.
+    # state_idx == 0 writes). Always write the dedicated output buffer.
     if src_block_idx == dest_block_idx and state_idx == 0:
-        if HAS_IDX_MAPPING:
-            tl.store(num_accepted_tokens_ptr + req_idx, 1)
-        else:
-            tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+        # V2 and V1 both write the separate output buffer.
+        tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+        # Output-buffer write above is intentionally unconditional.
+        pass
 
     # Skip no-op self-copy.
     if src_block_idx == dest_block_idx and accept_token_bias == 0:

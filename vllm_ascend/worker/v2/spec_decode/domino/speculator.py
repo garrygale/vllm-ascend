@@ -21,14 +21,11 @@ class AscendDominoSpeculator(DominoSpeculator):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
 
-        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
-        if cudagraph_mode.has_full_cudagraphs():
-            self.update_stream: torch.npu.Stream = torch.npu.Stream()
-
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
         if self.query_cudagraph_manager is not None:
             self.query_cudagraph_manager.speculator = self
+            self.query_cudagraph_manager.update_stream = self.update_stream
 
     def load_draft_model(
         self,
