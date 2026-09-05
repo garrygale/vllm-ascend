@@ -123,8 +123,17 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
-        num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens, device=self.device)
+        # Keep this on CPU, matching ModelAclGraphManager and the vLLM
+        # DPMetadata contract. A device tensor here makes DPMetadata.make()
+        # assert on a GPU scalar, forcing a device sync immediately after an
+        # asynchronous ACL graph replay.
+        num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
 
+        dp_trace(
+            "ascend_dflash.run_fullgraph_context_start",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
         with set_forward_context(
             self.speculator.model_state.attn_metadata,
             self.vllm_config,
@@ -134,6 +143,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             batch_descriptor=None,  # Full graph model don't need batch_descriptor
             slot_mapping=None,
         ):
+            dp_trace(
+                "ascend_dflash.run_fullgraph_context_entered",
+                rank=getattr(self.speculator, "dp_rank", None),
+                num_tokens=num_tokens,
+            )
             # decide to update draft graph params
             _EXTRA_CTX.is_draft_model = True
 
