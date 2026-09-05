@@ -133,14 +133,14 @@ Relevant commits:
 
 - vllm-ascend `80a34506f` — pass CPU `num_tokens_across_dp` to draft graph
   context (the direct fix).
-- vllm-ascend `7fd05c2d5` — stage-by-stage trace inside
-  `DFlashAclGraphManager.run_fullgraph()` (diagnostic, can be removed after
-  validation).
 - vllm-ascend `1da71a0cb` — share main/draft ACL update streams and clear
   stale GDN conv state.
-- vLLM `9c627fd7f9` — Domino skips the second DP dispatch all-reduce but
-  reuses the main model's agreed padded batch geometry for graph dispatch.
-- vLLM `2711419f15` / `5428ebd3fd` — `VLLM_DP_TRACE` instrumentation.
+- vLLM `5b76a86eca` — Domino skips the second per-step DP dispatch all-reduce
+  (the dense draft runs no cross-DP collective).
+
+Diagnostic-only changes (`VLLM_DP_TRACE` in vLLM and vllm-ascend, plus the
+stage-by-stage graph trace) were added during investigation and later
+removed; they are not part of the fix.
 
 ## Validation
 
@@ -150,13 +150,35 @@ With the CPU-tensor fix:
   request completes and produces results; the service no longer hangs.
 - The four workers now continue through
   `ascend_dflash.run_fullgraph_update_done`.
+- Larger-scale multi-worker verification also completes without the
+  112/105 draft-graph metadata mismatch described below.
 
 The 32-worker acceptance collapse tracked in
 `docs/domino_acceptance_batch_issue_2026-09-04.md` is a separate issue and
 should be re-tested after this fix.
 
+## Subsequent regression: do not reuse the main model's padded request count
+
+After the CPU-tensor fix, a temporary vLLM change (`9c627fd7f9`) made Domino
+dispatch its draft graph from the main model's padded `batch_desc.num_reqs`
+instead of the live request count. In a 32-worker/DP test, immediately after a
+request finished, the main graph padded from 15 live requests back to 16, so
+Domino replayed a 112-token draft graph while the draft metadata still
+described 15 live requests (105 tokens):
+
+```text
+queryT(112) must be equal to the last element of actualSequenceLengthQ(105)
+```
+
+That change was reverted in vLLM `92d900a62f`. Domino now dispatches from its
+actual live request count, while still skipping the second per-step DP
+all-reduce. The CPU-tensor fix in vllm-ascend `80a34506f` remains the actual
+DP full-graph hang fix.
+
 ## Notes for future debugging
 
 `VLLM_DP_TRACE` instrumentation was removed after validation. Future
 graph/Domino DP work should keep `num_tokens_across_dp` on CPU wherever it is
-fed into vLLM's forward-context / `DPMetadata` machinery.
+fed into vLLM's forward-context / `DPMetadata` machinery, and should not make
+the draft graph manager assume that the main model's padded request count is
+an acceptable Domino token count for metadata construction.
