@@ -4,7 +4,6 @@
 
 from typing import Any, cast
 
-import os
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
@@ -25,7 +24,6 @@ class AscendDominoSpeculator(DominoSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
-        self._debug_seen = False
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if (
@@ -210,13 +208,8 @@ class AscendDominoSpeculator(DominoSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         self.input_batch = input_batch
-        old_draft_tokens = (
-            self.draft_tokens[: input_batch.num_reqs].detach().cpu()
-            if os.getenv("VLLM_DOMINO_DEBUG")
-            else None
-        )
         with build_attn_metadata_wrapper():
-            draft_tokens = super().propose(
+            return super().propose(
                 input_batch,
                 attn_metadata,
                 slot_mappings,
@@ -234,59 +227,3 @@ class AscendDominoSpeculator(DominoSpeculator):
                 mm_inputs,
                 is_profile=is_profile,
             )
-        self._debug_log_proposal(
-            input_batch,
-            num_sampled,
-            num_rejected,
-            old_draft_tokens,
-            draft_tokens,
-        )
-        return draft_tokens
-
-    def _debug_log_proposal(
-        self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        old_draft_tokens: torch.Tensor | None,
-        draft_tokens: torch.Tensor,
-    ) -> None:
-        """Env-gated per-step draft dump for acceptance collapse triage.
-
-        Enable with ``VLLM_DOMINO_DEBUG=1``. Only steps containing at least
-        one fully rejected request are printed, which keeps the log focused on
-        degraded windows.
-        """
-        if not os.getenv("VLLM_DOMINO_DEBUG"):
-            return
-        if input_batch.num_reqs == 0:
-            return
-        ns = num_sampled.detach().cpu()
-        if not self._debug_seen:
-            self._debug_seen = True
-            print(
-                "[DOMINO_DEBUG] hook active: num_reqs=%d first_num_sampled=%s"
-                % (len(ns), ns.tolist()),
-                flush=True,
-            )
-        if not bool((ns <= 1).any().item()):
-            return
-        nr = num_rejected.detach().cpu()
-        tokens = draft_tokens.detach().cpu().tolist()
-        print(
-            "[DOMINO_DEBUG] req_ids=%s num_sampled=%s num_rejected=%s"
-            % (input_batch.req_ids[: len(ns)], ns.tolist(), nr.tolist()),
-            flush=True,
-        )
-        for i, req_id in enumerate(input_batch.req_ids[: len(ns)]):
-            if int(ns[i]) <= 1:
-                old = (
-                    old_draft_tokens[i].tolist()
-                    if old_draft_tokens is not None
-                    else None
-                )
-                print(
-                    "[DOMINO_DEBUG] req=%s prev_drafts=%s new_drafts=%s"
-                    % (req_id, old, tokens[i]),
-                    flush=True,
-                )
