@@ -21,6 +21,7 @@ class AscendDominoSpeculator(DominoSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+        self._debug_seen = False
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
@@ -235,6 +236,13 @@ class AscendDominoSpeculator(DominoSpeculator):
         if input_batch.num_reqs == 0:
             return
         ns = num_sampled.detach().cpu()
+        if not self._debug_seen:
+            self._debug_seen = True
+            print(
+                "[DOMINO_DEBUG] hook active: num_reqs=%d first_num_sampled=%s"
+                % (len(ns), ns.tolist()),
+                flush=True,
+            )
         if not bool((ns <= 1).any().item()):
             return
         nr = num_rejected.detach().cpu()
