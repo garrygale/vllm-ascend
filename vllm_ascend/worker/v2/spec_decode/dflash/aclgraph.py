@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (  # type: ignore[import-not-foun
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+from vllm.v1.worker.gpu.dp_utils import dp_trace
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -82,12 +83,43 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
 
+        dp_trace(
+            "ascend_dflash.run_fullgraph_metadata_start",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+            desc_reqs=desc.num_reqs,
+        )
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
+        dp_trace(
+            "ascend_dflash.run_fullgraph_metadata_done",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
+        dp_trace(
+            "ascend_dflash.run_fullgraph_wait_stream_start",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
         self.update_stream.wait_stream(torch.npu.current_stream())
+        dp_trace(
+            "ascend_dflash.run_fullgraph_wait_stream_done",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
+        dp_trace(
+            "ascend_dflash.run_fullgraph_replay_start",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
         ret = super().run_fullgraph(desc)
+        dp_trace(
+            "ascend_dflash.run_fullgraph_replay_done",
+            rank=getattr(self.speculator, "dp_rank", None),
+            num_tokens=num_tokens,
+        )
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -109,6 +141,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
 
             forward_context = get_forward_context()
 
+            dp_trace(
+                "ascend_dflash.run_fullgraph_update_start",
+                rank=getattr(self.speculator, "dp_rank", None),
+                num_tokens=num_tokens,
+            )
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 list(self.speculator.attn_backends.values())[0],
@@ -118,5 +155,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 self.vllm_config,
                 self.speculator.speculative_config,
                 draft_attn_metadatas=draft_attn_metadatas,
+            )
+            dp_trace(
+                "ascend_dflash.run_fullgraph_update_done",
+                rank=getattr(self.speculator, "dp_rank", None),
+                num_tokens=num_tokens,
             )
         return ret
