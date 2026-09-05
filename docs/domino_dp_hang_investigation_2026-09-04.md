@@ -1,7 +1,7 @@
-# Domino + MoE target DP hang (dp>1, tp=2, EP) — open investigation
+# Domino + MoE target DP hang (dp>1, tp=2, EP) — resolved investigation
 
 Date: 2026-09-04
-Status: open — reproducing and instrumenting
+Status: fixed — Domino DP full-graph hang resolved on MRV2
 
 ## Context
 
@@ -95,19 +95,69 @@ queues, rather than Domino itself (dense; no EP).
 So the primary suspect is an EngineCore or worker collective hang, not the
 HTTP/front-end path.
 
-## Next step
+## Root cause
 
-Add an env-gated rank trace (`VLLM_DP_TRACE=1`, optional `=2` for per-dispatch
-logs) at:
+The hang was on the Domino draft **ACL full-graph** path, not in the DP
+dispatch all-reduce or in the EngineCore loop.
 
-- `DPEngineCoreProc.run_busy_loop` and `_has_global_unfinished_reqs`
-- worker `execute_model` / `sample_tokens` / `execute_dummy_batch`
-- `sync_cudagraph_and_dp_padding` enter/exit
-- Domino `propose()` enter/exit
+`VLLM_DP_TRACE=1` showed that all four workers (two TP ranks per DP rank)
+reached `dflash.run_fullgraph_enter` and `dflash.run_fullgraph_exit`
+inside the Domino draft graph manager, but never reached the post-replay
+graph-parameter update. The blocking point was the
+`DFlashAclGraphManager.run_fullgraph()` context setup immediately after
+`super().run_fullgraph(desc)`:
 
-Run the single-request repro with the trace enabled and wait for the hang.
-The last lines from each `EngineCore_DP*` / `Worker_DP*` process should reveal
-which rank entered a collective without its counterpart.
+- `run_fullgraph()` built `num_tokens_across_dp` with `device=self.device`
+  (an NPU tensor).
+- It then entered vLLM's `set_forward_context()` with that tensor.
+- vLLM's `DPMetadata.make()` treats that argument as a CPU tensor
+  (`num_tokens_across_dp_cpu`) and evaluates
+  `assert num_tokens_across_dp_cpu[dp_rank] == batchsize`.
+- On an NPU tensor, that assert becomes a device sync immediately after an
+  asynchronous ACL graph replay, and the sync never completed.
 
-Do not conflate this issue with the separate 32-worker acceptance collapse
-(see `domino_acceptance_batch_issue_2026-09-04.md`).
+The main-model graph manager and the Eagle graph manager both create this
+tensor on CPU; only the DFlash/Domino graph manager used `device=self.device`.
+
+## Fix
+
+Pass a CPU tensor to `set_forward_context()` in
+`vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py`, matching the other
+graph managers:
+
+```python
+num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
+```
+
+Relevant commits:
+
+- vllm-ascend `80a34506f` — pass CPU `num_tokens_across_dp` to draft graph
+  context (the direct fix).
+- vllm-ascend `7fd05c2d5` — stage-by-stage trace inside
+  `DFlashAclGraphManager.run_fullgraph()` (diagnostic, can be removed after
+  validation).
+- vllm-ascend `1da71a0cb` — share main/draft ACL update streams and clear
+  stale GDN conv state.
+- vLLM `9c627fd7f9` — Domino skips the second DP dispatch all-reduce but
+  reuses the main model's agreed padded batch geometry for graph dispatch.
+- vLLM `2711419f15` / `5428ebd3fd` — `VLLM_DP_TRACE` instrumentation.
+
+## Validation
+
+With the CPU-tensor fix:
+
+- `dp=2`, `tp=2`, MoE/EP enabled, Domino draft, MRV2 full graph: the single
+  request completes and produces results; the service no longer hangs.
+- The four workers now continue through
+  `ascend_dflash.run_fullgraph_update_done`.
+
+The 32-worker acceptance collapse tracked in
+`docs/domino_acceptance_batch_issue_2026-09-04.md` is a separate issue and
+should be re-tested after this fix.
+
+## Notes for future debugging
+
+`VLLM_DP_TRACE=1` remains in the branches used to validate the fix. The
+diagnostic trace lines can be removed once validation is complete. Future
+graph/Domino DP work should keep `num_tokens_across_dp` on CPU wherever it is
+fed into vLLM's forward-context / `DPMetadata` machinery.
