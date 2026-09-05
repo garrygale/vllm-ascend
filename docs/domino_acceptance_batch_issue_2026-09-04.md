@@ -1,7 +1,7 @@
 # Domino acceptance collapse under 32-way concurrency (open issue)
 
 Date: 2026-09-04
-Status: open — parked for later debugging
+Status: open — active 2026-09-05; sliding-window draft path suspected
 
 ## Context
 
@@ -76,13 +76,62 @@ acceptance jumped to 8.00 (all draft positions accepted) after roughly
 150 draft rounds and stayed there until the end. Not yet explained;
 could be genuine degenerate repetition or a state/bookkeeping bug.
 
+## 2026-09-05 update
+
+The DP hang is fixed separately (see `domino_dp_hang_investigation_2026-09-04.md`),
+but the acceptance issue remains under higher worker counts.
+
+### Confirmed results
+
+- dp=1/16: healthy, including with KV usage forced to ~80%.
+- dp=1/32, full eager: decays; near-end per-position acceptance falls to ~0.
+- dp=1/32 with replacement delays 0/100/500 ms: all three still decay. This
+  rules out a simple finished-request/cleanup-rate race.
+- dp=2/16 graph mode behaves between dp=1/16 and dp=1/32: acceptance decays,
+  partially recovers, then decays again.
+- The 16→32 threshold is around 28 in the tested setup and may drift.
+- Same prompt (humaneval/159) is readable in a healthy single request but
+  random throughout when captured during the degraded 32-worker window.
+
+### Draft sliding-window experiment
+
+Changing all draft sliding-window layers to full attention significantly
+changes draft accuracy (as expected), but the worker-count instability
+largely disappears:
+
+- Full-attention draft remained stable through 64 workers and showed less
+  decay than the sliding-window draft at 32 workers.
+- A degraded full-attention sample kept the prompt prefix intact but could
+  produce random digit-like continuation (e.g. `2   2   19  2  2 2     2`).
+
+This implicates the non-causal sliding-window draft attention path rather
+than a general batch-size bug in the draft backbone or target model alone.
+
+### Debug hook status
+
+`VLLM_DOMINO_DEBUG=1` now prints a hook-active marker and collapse-step rows
+from `AscendDominoSpeculator`. Hook activation is confirmed, but per-request
+rows are interleaved with the 32-worker background and have not yet been
+isolated. A request-scoped/timestamped dump is the next step if needed.
+
+### Next experiments
+
+- Cap draft sliding windows to `<=2048` (replace the two `3072` windows).
+- Keep 512/1024 sliding layers and make only the large-window layers full
+  attention.
+- Collect exact launch command, `max_num_seqs`, `mamba_cache_mode`,
+  async-scheduling setting, and `triton.__version__`.
+- Determine whether corrupted output begins only after context length exceeds
+  the 2048 FIA band mask boundary.
+
 ## Remaining hypotheses
 
-1. A per-sequence state bug in the newly ported MRV2 Mamba/GDN path that
-   only appears when enough requests share a batch (16 vs 32 workers).
-2. KV block free/reuse corruption at ~80% occupancy without preemption:
-   freed GDN/draft blocks reallocated to new requests are not fully
-   reset.
+1. Non-causal sliding-window draft attention (FIA `sparse_mode=4` band path)
+   corrupts neighboring/stateful cache memory under high worker counts.
+2. A per-sequence state bug in the MRV2 Mamba/GDN path that only appears when
+   enough requests share a batch.
+3. KV/draft block reuse is still involved but only when combined with the
+   sliding-window draft cache path.
 
 Upstream fixes that are absent from the current vllm/vllm-ascend
 branches and may be relevant when revisiting:
