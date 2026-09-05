@@ -157,7 +157,6 @@ should be re-tested after this fix.
 
 ## Notes for future debugging
 
-`VLLM_DP_TRACE=1` remains in the branches used to validate the fix. The
-diagnostic trace lines can be removed once validation is complete. Future
+`VLLM_DP_TRACE` instrumentation was removed after validation. Future
 graph/Domino DP work should keep `num_tokens_across_dp` on CPU wherever it is
 fed into vLLM's forward-context / `DPMetadata` machinery.
