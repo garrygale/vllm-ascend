@@ -479,13 +479,39 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.vllm_config.quant_config, "enable_c8_quant", False
         )
         self._use_layer_aware_fia_graph_replay = needs_layer_aware_fia_graph_replay()
-        self._use_max_workspace_for_fia_graph = self._use_layer_aware_fia_graph_replay
+        self._use_max_workspace_for_fia_graph = (
+            self._use_layer_aware_fia_graph_replay
+            or self._uses_mixed_fia_geometry()
+        )
         self.sinks = sinks
         self.layerIndex = 0
         # Some mixed-attention models cannot rely on the iteration order of
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+
+    def _uses_mixed_fia_geometry(self) -> bool:
+        """Whether this draft's FIA layers share one graph size but need
+        different per-layer workspace/geometry (e.g. Domino per-layer
+        sliding windows)."""
+        if self.sliding_window is None:
+            return False
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or speculative_config.draft_model_config is None:
+            return False
+        hf_config = getattr(
+            speculative_config.draft_model_config, "hf_config", None
+        )
+        dflash_config = (
+            getattr(hf_config, "dflash_config", None) or {}
+            if hf_config is not None
+            else {}
+        )
+        windows = dflash_config.get("sliding_window")
+        return (
+            isinstance(windows, (list, tuple))
+            and len(set(windows)) > 1
+        )
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -835,7 +861,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         metadata = attn_metadata[draft_step][key]
                         seq_lens = metadata.seq_lens_list
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
-                        block_tables = metadata.block_tables
                         attn_count = attn_count + 1
                         if not metadata.causal:
                             # Full-attention layers use the captured
@@ -843,6 +868,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             # keep the captured symmetric band.
                             if pre_tokens == SWA_INT_MAX:
                                 sparse_mode = 0
+                        # Same full-graph replay rule as the upstream SWA fix:
+                        # rebinding ``block_tables`` to the latest metadata
+                        # tensor corrupts sliding-window FIA layers on Ascend.
+                        # The captured tensor aliases the persistent
+                        # ``input_block_tables`` buffer, whose contents are
+                        # refreshed in place before every replay.  Only
+                        # full-attention layers (pre_tokens == SWA_INT_MAX)
+                        # keep refreshing the metadata tensor.
+                        if pre_tokens == SWA_INT_MAX:
+                            block_tables = metadata.block_tables
                     else:
                         metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
                         seq_lens = attn_metadata[metadata_key].seq_lens_list
