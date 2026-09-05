@@ -86,6 +86,18 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+def _worker_dp_trace(scope: str, vllm_config: VllmConfig | None = None, **fields) -> None:
+    try:
+        from vllm.v1.worker.gpu.dp_utils import dp_trace
+
+        rank = None
+        if vllm_config is not None:
+            rank = vllm_config.parallel_config.data_parallel_rank
+        dp_trace(scope, rank=rank, **fields)
+    except Exception:
+        pass
+
+
 class NPUWorker(WorkerBase):
     def __init__(
         self,
@@ -595,6 +607,15 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        _worker_dp_trace(
+            "worker.execute_model_enter",
+            self.vllm_config,
+            scheduled_tokens=(
+                scheduler_output.total_num_scheduled_tokens
+                if scheduler_output is not None
+                else None
+            ),
+        )
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
@@ -658,6 +679,7 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        _worker_dp_trace("worker.sample_tokens_enter", self.vllm_config)
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
@@ -966,8 +988,10 @@ class NPUWorker(WorkerBase):
         self.model_runner.reset_encoder_cache()
 
     def execute_dummy_batch(self) -> None:
+        _worker_dp_trace("worker.execute_dummy_batch_enter", self.vllm_config)
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        _worker_dp_trace("worker.execute_dummy_batch_exit", self.vllm_config)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
