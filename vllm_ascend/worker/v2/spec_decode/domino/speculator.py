@@ -4,6 +4,7 @@
 
 from typing import Any, cast
 
+import os
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
