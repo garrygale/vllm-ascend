@@ -8,16 +8,12 @@ import os
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.domino.speculator import DominoSpeculator
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
-
-logger = init_logger(__name__)
 
 class AscendDominoSpeculator(DominoSpeculator):
     _speculator_name = "Domino"
@@ -27,32 +23,10 @@ class AscendDominoSpeculator(DominoSpeculator):
         self.input_batch: InputBatch | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        if (
-            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and self._has_stateful_gdn_layers()
-            and os.getenv("VLLM_DOMINO_DRAFT_FULL_GRAPH") != "1"
-        ):
-            logger.warning(
-                "Domino draft FULL-graph replay is disabled because the target "
-                "has stateful GDN/Mamba layers; the draft will run eagerly "
-                "while the target graph is preserved. Set "
-                "VLLM_DOMINO_DRAFT_FULL_GRAPH=1 to force the full draft graph."
-            )
-            cudagraph_mode = CUDAGraphMode.NONE
         super().init_cudagraph_manager(cudagraph_mode)
         if self.query_cudagraph_manager is not None:
             self.query_cudagraph_manager.speculator = self
             self.query_cudagraph_manager.update_stream = self.update_stream
-
-    def _has_stateful_gdn_layers(self) -> bool:
-        """Whether the service's KV groups include stateful GDN/Mamba layers."""
-        kv_cache_config = getattr(self, "kv_cache_config", None)
-        if kv_cache_config is None:
-            return False
-        return any(
-            isinstance(group.kv_cache_spec, MambaSpec)
-            for group in kv_cache_config.kv_cache_groups
-        )
 
     def load_draft_model(
         self,
