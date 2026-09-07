@@ -1,7 +1,8 @@
-# Domino acceptance collapse under 32-way concurrency (open issue)
+# Domino acceptance collapse under 32-way concurrency (resolved)
 
 Date: 2026-09-04
-Status: open — active 2026-09-05; sliding-window draft path suspected
+Status: fixed — 2026-09-07 (vllm-ascend `aa66a707e`), with the
+windows-capped draft recipe validated on NPU
 
 ## Context
 
@@ -124,6 +125,50 @@ isolated. A request-scoped/timestamped dump is the next step if needed.
 - Determine whether corrupted output begins only after context length exceeds
   the 2048 FIA band mask boundary.
 
+## 2026-09-07 resolution
+
+### Two separate triggers
+
+1. **Non-causal draft windows above 2048.** The trained
+   `[3072, 2048, 512, 512, 1024, 1024, 3072]` recipe corrupts the FIA
+   non-causal band path (`sparse_mode=4` with the fixed `2048x2048` band
+   mask) under sustained load, including full eager. Capping the two 3072
+   layers to 2048 removes the corruption and is stable through 64 workers in
+   eager mode; this is why the earlier full-attention and 2048-cap draft
+   experiments changed the instability.
+
+2. **Target FULL-graph replay with stale padded GDN/Mamba rows.** With
+   windows capped to <=2048, dp=2/48 graph mode still decayed while eager
+   stayed healthy. Forcing the Domino draft eager (vllm-ascend `827ca25d7`)
+   did **not** fix it, proving the corruption is in the target graph, not the
+   draft graph. Attention-side graph fixes (captured block tables and max
+   workspace, `8050f9801`), fine-grained graph capture sizes, and
+   `--no-async-scheduling` also did not fix it.
+
+The graph bug is the same class as the MTP/GDN bug fixed by vllm-ascend
+PR #15529: uniform FULL decode graphs collapse padded rows to the live
+request count in `_pad_query_start_loc_for_fia`, while GDN graphs capture
+metadata at request granularity. After requests finish, replayed padded
+slots can still hold persistent conv/recurrent state indices from freed
+blocks.
+
+Fix (`aa66a707e`):
+
+- `vllm_ascend/worker/v2/model_runner.py`: preserve the captured request
+  shape for uniform decode FULL graphs instead of collapsing padding into a
+  synthetic dummy request.
+- `vllm_ascend/worker/v2/model_states/mamba_hybrid.py`: mark padded
+  Mamba/GDN rows as speculative dummies
+  (`num_decode_draft_tokens = num_spec`) so replay uses the same pure-spec
+  GDN path as capture and refreshes/nullifies padded state rows every replay.
+- `vllm_ascend/worker/v2/aclgraph_utils.py`: expose `embed_input_ids` on the
+  graph wrapper.
+
+### Validation
+
+The previously failing graph configuration (dp=2/48 with windows <=2048) no
+longer shows the acceptance decay after `aa66a707e`.
+
 ## Remaining hypotheses
 
 1. Non-causal sliding-window draft attention (FIA `sparse_mode=4` band path)
@@ -159,3 +204,7 @@ branches and may be relevant when revisiting:
 
 `dp > 1` with `tp=2` and EP enabled never finishes a single incoming
 request (hang). Tracked separately; do not conflate with this issue.
+
+The DP hang itself was resolved separately on 2026-09-04/05
+(see `domino_dp_hang_investigation_2026-09-04.md`); it is unrelated to the
+acceptance issue documented above.
