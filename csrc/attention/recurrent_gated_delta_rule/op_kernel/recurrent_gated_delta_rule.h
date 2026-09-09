@@ -63,7 +63,6 @@ public:
         realV_ = tilingData->dv;
         scale_ = tilingData->scale;
         hasAcceptedTokens_ = (tilingData->hasAcceptedTokens == 1);
-        stateIndexStride_ = tilingData->stateIndexStride;
         hasGama_ = (tilingData->hasGama == 1);
         hasGamaK_ = (tilingData->hasGamaK == 1);
         useAddFoldReduce_ = (RGDR_ENABLE_ADD_FOLD_REDUCE != 0);
@@ -166,9 +165,6 @@ public:
             if (seqLen > static_cast<int32_t>(MAX_MTP)) {
                 return;
             }
-            if (stateIndexStride_ > 0 && seqLen > static_cast<int32_t>(stateIndexStride_)) {
-                return;
-            }
             if (seq1 < 0 || seq1 > static_cast<int32_t>(T_) || (seq1 + seqLen) > static_cast<int32_t>(T_)) {
                 return;
             }
@@ -182,31 +178,18 @@ public:
                 }
                 copyFlag++;
                 if (copyFlag == 1) {
-                    int32_t stateTokenIdx = stateIndexStride_ > 0
-                                                ? static_cast<int32_t>(batch_i * stateIndexStride_)
-                                                : seq0;
+                    int32_t stateTokenIdx = seq0;
                     if (hasAcceptedTokens_) {
                         int32_t acceptedTokenNum = numAcceptedTokensGm_.GetValue(batch_i);
-                        int32_t acceptedLimit = stateIndexStride_ > 0
-                                                    ? static_cast<int32_t>(stateIndexStride_)
-                                                    : seqLen;
-                        if (acceptedTokenNum <= 0 || acceptedTokenNum > acceptedLimit) {
+                        if (acceptedTokenNum <= 0 || acceptedTokenNum > seqLen) {
                             return;
                         }
-                        stateTokenIdx += acceptedTokenNum - 1;
+                        stateTokenIdx = seq0 + acceptedTokenNum - 1;
                     }
-                    if (stateIndexStride_ > 0) {
-                        int32_t stateOffsetValue = ssmStateIndicesGm_.GetValue(stateTokenIdx);
-                        if (stateOffsetValue < 0) {
-                            return;
-                        }
-                        stateOffset = static_cast<uint64_t>(stateOffsetValue);
-                    } else {
-                        stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
-                    }
+                    stateOffset = ssmStateIndicesGm_.GetValue(stateTokenIdx);
                     CopyInGamaBeta(seq0, seq1);
                 }
-                ProcessHead(seq0, seq1, head_i, stateOffset, batch_i);
+                ProcessHead(seq0, seq1, head_i, stateOffset);
             }
             if (hasGama_ && copyFlag != 0) {
                 gamaInQueue_.FreeTensor(gamaInUb);
@@ -456,8 +439,7 @@ private:
         }
     }
 
-    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset,
-                                       uint64_t batch_i)
+    __aicore__ inline void ProcessHead(int32_t seq0, int32_t seq1, uint64_t head_i, uint64_t stateOffset)
     {
         uint64_t vOffset = (seq0 * NV_ + head_i) * realV_;
         uint64_t qkOffset = (seq0 * NK_ + head_i / (NV_ / NK_)) * realK_;
@@ -490,11 +472,8 @@ private:
                 uint64_t curQKOffset = (seq_i - seq0) * alignK_;
                 uint64_t curVOffset = (seq_i - seq0) * alignV_ + v_i;
                 uint64_t attnOffset = (seq_i * NV_ + head_i) * realV_ + v_i;
-                uint64_t stateTokenIdx = stateIndexStride_ > 0
-                                             ? batch_i * stateIndexStride_ + (seq_i - seq0)
-                                             : seq_i;
                 uint64_t curStateOutOffset =
-                    ((ssmStateIndicesGm_.GetValue(stateTokenIdx) * NV_ + head_i) * realV_ + v_i) * realK_;
+                    ((ssmStateIndicesGm_.GetValue(seq_i) * NV_ + head_i) * realV_ + v_i) * realK_;
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
@@ -586,7 +565,6 @@ private:
     uint32_t stateOutBufferNum_;
     uint32_t attnOutBufferNum_;
     uint32_t restUbSize_;
-    uint32_t stateIndexStride_;
     uint32_t load;
     uint32_t usedblk;
     uint32_t avgload;

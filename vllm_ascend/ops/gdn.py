@@ -169,6 +169,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
@@ -372,12 +373,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state=ssm_state,
                 scale=key_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
-                # Keep the fixed per-request state rows. The recurrent kernel
-                # selects the initial state by (request, accepted-token) and
-                # writes each token's state back into its own row; flattening
-                # this table only works when every verification row has the
-                # full num_spec + 1 width.
-                ssm_state_indices=spec_causal_conv1d_meta.cache_indices,
+                ssm_state_indices=spec_state_indices_tensor.flatten(),
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)
         else:

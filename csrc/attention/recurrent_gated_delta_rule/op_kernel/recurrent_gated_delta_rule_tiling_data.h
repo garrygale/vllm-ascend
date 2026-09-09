@@ -36,9 +36,6 @@ struct alignas(8) RecurrentGatedDeltaRuleTilingData { // alignas(8)确保8字节
     uint32_t hasGama;
     uint32_t hasGamaK;
     uint32_t hasAcceptedTokens;
-    // Width of one request row in a 2-D ssm_state_indices tensor. Zero keeps
-    // the legacy token-indexed layout used by non-speculative calls.
-    uint32_t stateIndexStride;
 };
 #pragma pack(pop)
 } // RecurrentGatedDeltaRule

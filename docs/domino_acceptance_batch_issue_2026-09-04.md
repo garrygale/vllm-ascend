@@ -1,10 +1,8 @@
 # Domino acceptance collapse under 32-way concurrency (resolved)
 
 Date: 2026-09-04
-Status: acceptance decay fixed 2026-09-07 (`aa66a707e`); graph-mode
-target-state corruption fixed in two 2026-09-09 follow-ups (fixed-row GDN
-state indexing and no-spec FULL-replay reset), with NPU end-to-end
-confirmation pending
+Status: fixed — 2026-09-07 (vllm-ascend `aa66a707e`), with the
+windows-capped draft recipe validated on NPU
 
 ## Context
 
@@ -171,146 +169,12 @@ Fix (`aa66a707e`):
 The previously failing graph configuration (dp=2/48 with windows <=2048) no
 longer shows the acceptance decay after `aa66a707e`.
 
-### 2026-09-09 follow-up: normal acceptance but repeated garbage tokens
-
-After `aa66a707e`, acceptance counters looked correct, but generated text could
-become repeated garbage after roughly 60 requests, usually starting midway
-through a response. This exposed a second graph-padding bug in the same
-function.
-
-`_pad_query_start_loc_for_fia` originally decided "uniform decode graph" from
-total token count alone:
-
-```text
-num_tokens_padded == descriptor_num_reqs * decode_query_len
-```
-
-A mixed prefill/decode batch can satisfy that equation even when no real
-request has decode query length. With descriptor 4, `decode_query_len=8`, and
-real query lengths `[4, 12, 16]`, the total is 32, so the old code took the
-uniform branch and produced:
-
-```text
-query_start_loc = [0, 4, 16, 32, 40]
-```
-
-The graph only has 32 input tokens, but the final padded row starts at 40.
-GDN metadata then describes a different request/token topology than the
-captured graph, so recurrent/conv state rows are refreshed at the wrong
-positions. Because that state survives across requests, corruption appears
-only after request churn and can leave acceptance counters normal while
-target hidden states produce repeated garbage.
-
-Fix (`3bc298c3e`, port of vllm-ascend PR #15707):
-
-- require every real query length to equal `decode_query_len` before taking
-  the uniform padding path;
-- otherwise use the mixed-batch dummy-row layout, which gives the example
-  above `query_start_loc = [0, 4, 16, 32, 32]`.
-
-The parallel-drafting `seq_lens` override is intentionally retained: this
-branch's vLLM base does not yet pass a CPU draft `seq_lens` into
-`build_attn_metadata`, so removing it would replace real draft lengths with
-`max_seq_len`.
-
-The same upstream PR also fixes a second long-context layout bug in the
-Qwen3.5/3.6 fused MRoPE path. The kernel reads three contiguous T/H/W
-planes (`[3, T, D]`), but text-only MRV2 forwards can pass 1D positions;
-indexing the cache with them yields `[T, D]`, so the H/W offsets read the
-wrong cache rows. `patch_qwen3_5.py` now expands 1D positions to three
-identical planes before the cache lookup. This can otherwise corrupt
-attention only after positions grow, matching the late/mid-response
-garbage symptom.
-
-This follow-up still needs NPU confirmation on the long-running service test.
-
-### 2026-09-09 follow-up: fixed-row GDN recurrent state indexing
-
-The remaining graph-mode garbage is a state-indexing bug in the existing
-AscendC recurrent GDN operator, not another padding-topology bug.
-
-`spec_state_indices_tensor` is a fixed `[request, num_spec + 1]` table. The
-operator previously received `spec_state_indices_tensor.flatten()` and indexed
-it with the cumulative token offset:
-
-```text
-initial_state_idx = seq0 + num_accepted_tokens[request] - 1
-output_state_idx  = seq0 + local_token_idx
-```
-
-That is correct only when every verification row has the full
-`num_spec + 1` width. When the scheduler truncates a row, or graph padding
-makes a row shorter, `seq0` is no longer `request * (num_spec + 1)`. The
-initial-state lookup and the per-token state writes then cross into another
-request's row. The builder had additionally clamped `num_accepted_tokens` to
-the current row length, which hid the invalid access but selected the wrong
-recurrent state after a previous step had accepted more tokens than the
-current verification width.
-
-This matches the observed failure mode: acceptance counters stay plausible,
-but the persistent target GDN state is corrupted and the generated text
-becomes garbage only after enough request churn for a short row to occur.
-
-The fix ports the fixed-row semantics from the unmerged D-Cut GDN operator
-(vllm-ascend PR #15207) into the existing operator instead of adding the
-full new operator family:
-
-- pass the 2-D `[B, S]` state table to `npu_recurrent_gated_delta_rule`
-  instead of flattening it;
-- accept `ssm_state_indices` as either legacy `[T]` or fixed `[B, S]`;
-- carry `S` in tiling data and index the initial state as
-  `request * S + accepted_token - 1` and output states as
-  `request * S + local_token`;
-- clamp accepted counts to `[1, num_spec + 1]`, not to the current row
-  length;
-- add NPU coverage for a `[2, 1]` verification batch whose first request has
-  `num_accepted_tokens = 3`.
-
-The legacy 1-D path is unchanged for non-speculative decode. The NPU
-long-running service test is still required to confirm the fix end-to-end.
-
-### 2026-09-09 follow-up: reset the captured spec branch on every no-spec replay
-
-The fixed-row state indexing fix removed the acceptance decay, but graph mode
-could still produce correct acceptance counters with garbage text after
-request churn. The user-observed threshold was important: the failure did not
-occur below 16 concurrent requests per DP rank, but appeared reliably above
-it.
-
-The remaining bug was in the Ascend GDN metadata builder's FULL-graph replay
-contract. A FULL graph captured with speculative decoding contains the
-speculative conv1d/recurrent tasks. At replay time those tasks consume
-persistent inputs (`spec_state_indices_tensor`, `spec_query_start_loc`,
-`num_accepted_tokens`, and `spec_actual_seq_lengths`) rather than rebuilding
-Python-side branches. The old code reset those inputs only for a pure
-non-spec decode replay. A mixed prefill/decode batch, or a batch with no
-runtime draft tokens, therefore replayed the captured spec tasks with stale
-metadata and advanced persistent GDN state belonging to another request.
-That is why the corruption needed both graph mode and enough concurrency to
-create mixed batches; below 16 requests the scheduler rarely formed one.
-
-The fix matches upstream vllm-ascend main:
-
-- reset the captured spec inputs whenever `num_spec_decodes == 0`, before
-  prefill/decode metadata is built, instead of only inside the pure non-spec
-  decode branch;
-- when a dynamic-SD batch contains no runtime draft tokens at all, clear the
-  spec masks instead of treating zero-draft rows as speculative rows;
-- keep Domino on the base `1 + 2 * num_spec` reorder threshold. The local
-  `num_spec` override was too small for the target's `1 + num_spec`
-  verification width.
-
-Regression tests cover the mixed-prefill no-spec replay, zero-draft dynamic
-SD rows, and Domino's reorder threshold. NPU end-to-end confirmation is still
-required.
-
 ## Remaining hypotheses
 
 1. Non-causal sliding-window draft attention (FIA `sparse_mode=4` band path)
    corrupts neighboring/stateful cache memory under high worker counts.
-2. ~~A per-sequence state bug in the MRV2 Mamba/GDN path that only appears
-   when enough requests share a batch.~~ Addressed by the fixed-row state
-   indexing change above; NPU confirmation pending.
+2. A per-sequence state bug in the MRV2 Mamba/GDN path that only appears when
+   enough requests share a batch.
 3. KV/draft block reuse is still involved but only when combined with the
    sliding-window draft cache path.
 

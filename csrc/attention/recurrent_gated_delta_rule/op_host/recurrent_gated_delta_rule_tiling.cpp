@@ -41,6 +41,7 @@ const size_t QKV_DIM_NUM = 3;
 const size_t BETA_DIM_NUM = 2;
 const size_t STATE_DIM_NUM = 4;
 const size_t CUSEQLENS_DIM_NUM = 1;
+const size_t SSM_STATE_INDICES_DIM_NUM = 1;
 const size_t G_DIM_NUM = 2;
 
 const size_t DIM_0 = 0;
@@ -263,28 +264,12 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::CheckShapeDimAndRelation(const ge
                                                                          const gert::Shape &cuSeqlensShape,
                                                                          const gert::Shape &ssmStateShape)
 {
-    const auto ssmStateDimNum = ssmStateShape.GetDimNum();
-    const bool legacyStateIndices = ssmStateDimNum == 1;
-    const bool fixedStateRows = ssmStateDimNum == 2;
     if (!CheckDim(queryShape, QKV_DIM_NUM, "query") || !CheckDim(keyShape, QKV_DIM_NUM, "key") ||
         !CheckDim(valueShape, QKV_DIM_NUM, "value") || !CheckDim(betaShape, BETA_DIM_NUM, "beta") ||
         !CheckDim(stateShape, STATE_DIM_NUM, "state") ||
         !CheckDim(cuSeqlensShape, CUSEQLENS_DIM_NUM, "actual_seq_lengths") ||
-        (!legacyStateIndices && !fixedStateRows)) {
+        !CheckDim(ssmStateShape, SSM_STATE_INDICES_DIM_NUM, "ssm_state_indices")) {
         return ge::GRAPH_FAILED;
-    }
-
-    if (fixedStateRows) {
-        const auto stateRows = ssmStateShape.GetDim(DIM_0);
-        const auto stateWidth = ssmStateShape.GetDim(DIM_1);
-        if (stateRows != cuSeqlensShape.GetDim(DIM_0) - 1 || stateWidth <= 0 ||
-            stateWidth > static_cast<int64_t>(MAX_MTP)) {
-            OP_LOGE(inputParams_.opName,
-                    "ssm_state_indices must be [B] or [B, S], where B matches actual_seq_lengths and "
-                    "1 <= S <= %zu",
-                    MAX_MTP);
-            return ge::GRAPH_FAILED;
-        }
     }
 
     if (!CheckDimEqual(queryShape, DIM_0, keyShape, DIM_0, "query", "key", "T dimension") ||
@@ -313,7 +298,6 @@ void RecurrentGatedDeltaRuleTiling::FillTilingShapeData(const gert::Shape &query
     tilingData_.dv = valueShape.GetDim(DIM_2);
     tilingData_.sBlockNum = stateShape.GetDim(DIM_0);
     tilingData_.b = cuSeqlensShape.GetDim(DIM_0) - 1;
-    tilingData_.stateIndexStride = 0;
 }
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::CheckShapeValueRangeAndRule()
@@ -367,10 +351,6 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::RuleFillTilingShapeData()
     const auto &stateShape = context_->GetInputShape(STATE_INDEX)->GetOriginShape();
     const auto &cuSeqlensShape = context_->GetInputShape(CUSEQLENS_INDEX)->GetOriginShape();
     FillTilingShapeData(queryShape, valueShape, stateShape, cuSeqlensShape);
-    const auto &ssmStateShape = context_->GetInputShape(SSM_STATE_INDICES_INDEX)->GetOriginShape();
-    if (ssmStateShape.GetDimNum() == 2) {
-        tilingData_.stateIndexStride = ssmStateShape.GetDim(DIM_1);
-    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -528,7 +508,6 @@ void RecurrentGatedDeltaRuleTiling::PrintTilingData()
     OP_LOGD(context_->GetNodeName(), "hasGama: [%u]", tilingData_.hasGama);
     OP_LOGD(context_->GetNodeName(), "hasGamaK: [%u]", tilingData_.hasGamaK);
     OP_LOGD(context_->GetNodeName(), "hasAcceptedTokens: [%u]", tilingData_.hasAcceptedTokens);
-    OP_LOGD(context_->GetNodeName(), "stateIndexStride: [%u]", tilingData_.stateIndexStride);
 }
 
 int64_t RecurrentGatedDeltaRuleTiling::CalcFixedUbBytes(int64_t aNv, int64_t aDv, int64_t aDk) const
