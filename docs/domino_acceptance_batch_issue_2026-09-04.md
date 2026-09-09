@@ -1,7 +1,7 @@
 # Domino acceptance collapse under 32-way concurrency
 
 Date: 2026-09-04
-Status: SWA-specific replay fix applied 2026-09-09; NPU validation pending
+Status: SWA cache-layout fix applied 2026-09-10; NPU validation pending
 
 ## Context
 
@@ -254,3 +254,42 @@ request (hang). Tracked separately; do not conflate with this issue.
 The DP hang itself was resolved separately on 2026-09-04/05
 (see `domino_dp_hang_investigation_2026-09-04.md`); it is unrelated to the
 acceptance issue documented above.
+
+## 2026-09-10 update
+
+The remaining full-attention-vs-SWA A/B difference is explained by how the
+draft's SWA layers were presented to the KV cache manager.
+
+Ascend's `Attention.get_kv_cache_spec()` selects the backend's smallest kernel
+block size for SWA layers (128 tokens) and returns a `SlidingWindowSpec`.
+`DominoDraftAttention` converted that to `FullAttentionSpec`, but preserved the
+small block size and the per-layer `sliding_window`.  The seven draft layers
+therefore formed several distinct full-attention KV cache groups with
+different logical block sizes and different windows, all sharing the target's
+global block pool and Mamba/GDN state pool.  A full-attention draft has one
+identical draft spec and one draft group, which is why it did not reproduce
+the corruption.
+
+The draft VllmConfig also re-entered Ascend's `refresh_block_size()` while
+loading the attention-only draft.  Because the draft is not itself hybrid,
+that path could reset the shared target `CacheConfig.block_size` from the
+resolved hybrid layout to 128, leaving the target attention and Mamba/GDN
+layout inconsistent.
+
+Fixes:
+
+- vLLM `0ab0059f85`: Domino SWA layers now publish one ordinary
+  `FullAttentionSpec` at the primary `cache_config.block_size`, with
+  `sliding_window=None`.  The per-layer window remains on the Attention
+  implementation and is still applied at compute time.  FlashAttention now
+  resolves the window from the layer, matching the KV cache group's
+  allocation-only semantics.
+- vLLM-Ascend `b50c9917f`: `refresh_block_size()` preserves the shared target
+  layout when the active model config is a separate speculative draft config,
+  and the Ascend FIA builder derives the non-causal band mask from the
+  group's Attention implementations instead of the allocation-only spec.
+
+Static checks (`git diff --check`, Python AST parse) pass.  NPU validation
+must confirm that dp=2/tp=2/EP, 48 concurrent workers, graph mode, and the
+original `[3072, 2048, 512, 512, 1024, 1024, 3072]` draft recipe no longer
+decay or corrupt verified tokens.
