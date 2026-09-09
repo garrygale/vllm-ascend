@@ -304,10 +304,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_spec = getattr(speculative_config, "num_speculative_tokens", None)
             if num_spec is not None:
                 # dflash counts the base token in addition to the N speculative
-                # tokens; dspark's threshold is just N by design.
+                # tokens; dspark's threshold is just N by design. Domino uses
+                # the target's 1 + N verification width, so keep the base
+                # threshold computed by _init_reorder_batch_threshold.
                 if method == "dflash":
                     self.reorder_batch_threshold = 1 + num_spec
-                elif method in ("dspark", "domino"):
+                elif method == "dspark":
                     self.reorder_batch_threshold = num_spec
 
     def _copy_sequence_indices_to_device(
@@ -575,11 +577,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             num_reqs = num_decode_draft_tokens_cpu.numel()
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
-            torch.ge(
-                num_decode_draft_tokens_cpu,
-                0,
-                out=spec_sequence_masks_cpu,
-            )
+            runtime_draft_tokens = num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
+            if runtime_draft_tokens.sum().item() > 0:
+                torch.ge(
+                    num_decode_draft_tokens_cpu,
+                    0,
+                    out=spec_sequence_masks_cpu,
+                )
+            else:
+                # Dynamic speculative decoding can be enabled while this batch
+                # carries no draft tokens. Treat it as ordinary decode unless a
+                # stateful spec-width prompt chunk must use the spec branch.
+                spec_sequence_masks_cpu.zero_()
             spec_sequence_masks_cpu, num_accepted_tokens = (
                 self._fold_spec_sized_prefill_chunks_into_spec(
                     m,
@@ -730,20 +739,22 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_sequence_indices,
             )
             # num_accepted_tokens includes the bonus token (1 + accepted draft
-            # tokens). A truncated final round can therefore exceed the row's
-            # actual varlen segment length even when every scheduled token is
-            # accepted; the custom recurrent/conv ops reject accepted > seqLen.
-            # Clamp active rows to their segment length before the op sees them.
-            spec_query_lens = torch.diff(spec_query_start_loc).to(
-                num_accepted_tokens.dtype
+            # tokens). The recurrent kernel selects the previous state from a
+            # fixed [request, num_spec + 1] row, so the accepted count may
+            # legitimately exceed the current verification width. Only clamp
+            # it to the state-row width; clamping to the current query length
+            # would select the wrong recurrent state after a truncated round.
+            num_accepted_tokens = num_accepted_tokens.clamp(
+                min=1,
+                max=self.num_spec + 1,
             )
-            # PyTorch rejects mixing a scalar min with a tensor max in clamp().
-            # Apply the lower bound first, then cap each row by its own
-            # segment length.
-            num_accepted_tokens = torch.minimum(
-                num_accepted_tokens.clamp(min=1),
-                spec_query_lens,
-            )
+
+        # A FULL graph retains captured speculative conv/recurrent tasks. Clear
+        # their stable inputs on every no-spec replay, including mixed
+        # prefill/decode batches, so an idle or prefill batch cannot mutate
+        # state belonging to another request.
+        if self.use_full_cuda_graph and self.use_spec_decode and num_spec_decodes == 0:
+            self._reset_spec_decode_graph_inputs(m.num_reqs)
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -870,8 +881,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
             graph_batch_size = m.num_reqs
-            if self.use_spec_decode:
-                self._reset_spec_decode_graph_inputs(graph_batch_size)
             (
                 non_spec_state_indices_tensor,
                 non_spec_query_start_loc,

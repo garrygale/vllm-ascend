@@ -9,7 +9,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -132,6 +132,8 @@ def _make_vllm_config(
     max_num_batched_tokens: int = 8192,
     num_heads: int = 32,
     num_speculative_tokens: int = 0,
+    method: str | None = None,
+    parallel_drafting: bool = False,
     mamba_cache_mode: str = "none",
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
 ):
@@ -139,7 +141,8 @@ def _make_vllm_config(
     if num_speculative_tokens > 0:
         speculative_config = SimpleNamespace(
             num_speculative_tokens=num_speculative_tokens,
-            parallel_drafting=False,
+            method=method,
+            parallel_drafting=parallel_drafting,
         )
 
     model_config = SimpleNamespace(max_model_len=max_model_len)
@@ -171,6 +174,8 @@ def _make_builder(
     device: torch.device,
     num_heads: int,
     num_speculative_tokens: int,
+    method: str | None = None,
+    parallel_drafting: bool = False,
     mamba_cache_mode: str = "none",
     block_size: int = 16,
     num_speculative_blocks: int = 0,
@@ -179,6 +184,8 @@ def _make_builder(
     vllm_config = _make_vllm_config(
         num_heads=num_heads,
         num_speculative_tokens=num_speculative_tokens,
+        method=method,
+        parallel_drafting=parallel_drafting,
         mamba_cache_mode=mamba_cache_mode,
         cudagraph_mode=cudagraph_mode,
     )
@@ -308,6 +315,20 @@ def test_sequence_index_buffers_cover_spec_decode_when_cudagraph_disabled():
 
     assert torch.equal(spec_indices, torch.tensor([0]))
     assert non_spec_indices.numel() == 0
+
+
+def test_domino_reorder_threshold_uses_target_verification_width():
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=7,
+        method="domino",
+        parallel_drafting=True,
+    )
+
+    # The target verification batch is 1 + num_spec tokens wide. A threshold
+    # of num_spec leaves full verification rows outside the decode region.
+    assert builder.reorder_batch_threshold == 1 + 2 * builder.num_spec
 
 
 def _cache_index_first_column(cache_indices: torch.Tensor) -> torch.Tensor:
@@ -483,6 +504,40 @@ def test_spec_conv1d_args_use_device_cache_and_accepted_tokens():
     )
 
 
+def test_spec_accepted_tokens_keep_previous_width_when_row_shorter():
+    """State-row selection must not be clamped to the current query length."""
+    batch_spec = BatchSpec(
+        seq_lens=[12, 12],
+        query_lens=[4, 1],
+        name="spec_short_row_previous_accept",
+    )
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=7,
+    )
+    num_accepted_tokens = torch.tensor([8, 2], dtype=torch.int32)
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=torch.tensor([7, 0], dtype=torch.int32),
+    )
+
+    assert torch.equal(
+        attn_metadata.spec_decode_metadata.actual_seq_lengths,
+        torch.tensor([0, 4, 1], dtype=torch.int32),
+    )
+    assert torch.equal(attn_metadata.num_accepted_tokens, num_accepted_tokens)
+    assert attn_metadata.spec_state_indices_tensor.shape == (2, 8)
+
+
 def test_full_graph_spec_conv1d_args_keep_request_granularity():
     batch_spec = BatchSpec(
         seq_lens=[4, 4, 4],
@@ -656,6 +711,93 @@ def test_full_graph_non_spec_actual_seq_lengths_use_padded_builder_buffer():
         attn_metadata.non_spec_decode_metadata.actual_seq_lengths,
         torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32),
     )
+
+
+def test_full_graph_mixed_prefill_resets_captured_spec_inputs():
+    """A no-spec FULL replay must neutralize the captured spec branch."""
+    batch_spec = BatchSpec(
+        seq_lens=[2, 4],
+        query_lens=[2, 4],
+        name="full_graph_mixed_prefill_without_spec",
+    )
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    builder.spec_state_indices_tensor.fill_(12345)
+    builder.spec_query_start_loc.fill_(12345)
+    builder.num_accepted_tokens.fill_(12345)
+    builder.spec_actual_seq_lengths.fill_(12345)
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.ones(batch_spec.batch_size, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.full(
+            (batch_spec.batch_size,),
+            -1,
+            dtype=torch.int32,
+        ),
+    )
+
+    assert attn_metadata.num_spec_decodes == 0
+    assert attn_metadata.spec_decode_metadata is None
+    assert torch.equal(
+        builder.spec_state_indices_tensor[: batch_spec.batch_size],
+        torch.full((batch_spec.batch_size,), PAD_SLOT_ID, dtype=torch.int32),
+    )
+    assert torch.equal(
+        builder.spec_query_start_loc[: batch_spec.batch_size + 1],
+        torch.zeros(batch_spec.batch_size + 1, dtype=torch.int32),
+    )
+    assert torch.equal(
+        builder.num_accepted_tokens[: batch_spec.batch_size],
+        torch.zeros(batch_spec.batch_size, dtype=torch.int32),
+    )
+    assert torch.equal(
+        builder.spec_actual_seq_lengths[: batch_spec.batch_size + 1],
+        torch.zeros(batch_spec.batch_size + 1, dtype=torch.int32),
+    )
+
+
+def test_zero_draft_schedule_does_not_select_spec_branch():
+    """Dynamic SD may emit zero-draft rows; they are ordinary decode rows."""
+    batch_spec = BatchSpec(
+        seq_lens=[1, 1],
+        query_lens=[1, 1],
+        name="zero_draft_schedule",
+    )
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.ones(batch_spec.batch_size, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.zeros(
+            batch_spec.batch_size,
+            dtype=torch.int32,
+        ),
+    )
+
+    assert attn_metadata.num_spec_decodes == 0
+    assert attn_metadata.spec_decode_metadata is None
+    assert attn_metadata.non_spec_decode_metadata is not None
 
 
 def test_causal_conv1d_cache_indices_use_device_block_table(monkeypatch: pytest.MonkeyPatch):

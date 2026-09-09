@@ -66,6 +66,11 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
         qkv, _ = self.qkv_proj(hidden_states)
         if "qwen3_5" in self.config.model_type:
+            # The fused MRoPE kernel reads three contiguous T/H/W planes.
+            # Text-only positions arrive as 1D; expand them before the cache
+            # lookup so the H/W plane offsets stay inside the selected rows.
+            if positions.ndim == 1:
+                positions = positions.unsqueeze(0).expand(3, -1)
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
             if cos_sin.device != qkv.device:
                 cos_sin = cos_sin.to(qkv.device)

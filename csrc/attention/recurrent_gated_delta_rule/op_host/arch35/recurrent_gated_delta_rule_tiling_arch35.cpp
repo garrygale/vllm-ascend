@@ -108,6 +108,8 @@ private:
         tilingData_.dv = valueShape.GetDim(DIM_2);
         tilingData_.sBlockNum = stateShape.GetDim(DIM_0);
         tilingData_.b = cuSeqlensShape.GetDim(DIM_0) - 1;
+        tilingData_.stateIndexStride =
+            ssmStateShape.GetDimNum() == 2 ? ssmStateShape.GetDim(DIM_1) : 0;
 
         OP_CHECK_IF(CheckShapeValueRangeAndRule() != ge::GRAPH_SUCCESS,
                     OP_LOGE(inputParams_.opName, "AnalyzeShapes rule failed: CheckShapeValueRangeAndRule"),
