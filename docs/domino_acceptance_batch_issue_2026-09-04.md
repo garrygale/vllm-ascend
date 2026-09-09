@@ -1,8 +1,7 @@
-# Domino acceptance collapse under 32-way concurrency (resolved)
+# Domino acceptance collapse under 32-way concurrency
 
 Date: 2026-09-04
-Status: fixed — 2026-09-07 (vllm-ascend `aa66a707e`), with the
-windows-capped draft recipe validated on NPU
+Status: SWA-specific replay fix applied 2026-09-09; NPU validation pending
 
 ## Context
 
@@ -199,6 +198,53 @@ branches and may be relevant when revisiting:
 - Collect the exact service launch command, startup log (max_num_seqs,
   mamba cache mode, async scheduling/graphs), and
   `triton.__version__`.
+
+## 2026-09-09 update
+
+The earlier "resolved" status was too broad.  A checkpoint with the same
+Domino weights and the same target model, but with every draft layer changed
+from sliding-window attention to full attention, is stable at high
+concurrency.  This isolates the remaining failure to the draft-side
+sliding-window path rather than the target GDN/Mamba state or the target
+graph alone.
+
+The current branch also regressed an upstream vllm-ascend full-graph fix when
+the v0.26 compatibility cleanup (`4bf5e099f`) removed
+`_update_draft_attn_metadata`.  With a live request count below the captured
+graph bucket, the parallel-draft metadata builder clamps cumulative query
+lengths at the live count and the DFlash input kernel leaves padded KV
+lengths at zero.  For example, a captured 6-request/7-token draft graph has
+
+```text
+actual_seq_lengths_q = [7, 14, 21, 28, 35, 42]
+seq_lens_list        = [s0, s1, s2, s3, s4, s5]
+```
+
+but a replay with three live requests produces
+
+```text
+actual_seq_lengths_q = [7, 14, 21, 21, 21, 21]
+seq_lens_list        = [s0, s1, s2, 0, 0, 0]
+```
+
+This is only reachable after a request finishes and the graph is replayed
+with padding.  FIA band mode (`sparse_mode=4`, used by the non-causal
+sliding-window draft layers) derives its tiling and band geometry from these
+lengths, so the mismatch can corrupt the draft output.  Full attention uses
+the non-band FIA path and tolerates the same padding, matching the
+full-attention A/B result.
+
+The fix restores the captured dummy-row geometry for DFlash, DSpark, and
+Domino before the full-graph parameter update:
+
+- cumulative query lengths cover the full padded graph token count;
+- padded KV lengths match the captured dummy rows (`num_query_per_req`)
+  instead of remaining zero;
+- the padded rows continue to use block 0 and their outputs are ignored.
+
+The independent FIA mask limit still applies: non-causal windows above 2048
+are not supported by the fixed `2048x2048` band mask and must remain capped
+to `<=2048` until the operator supports a larger band.
 
 ## Related separate issue
 

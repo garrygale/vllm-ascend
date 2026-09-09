@@ -29,6 +29,9 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 )
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.spec_decode.draft_attn_metadata import (
+    pad_parallel_draft_attn_metadata,
+)
 
 
 class AscendDSparkSpeculator(DSparkSpeculator):
@@ -92,6 +95,12 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 num_tokens_padded=num_tokens_padded,
                 causal=self._group_causal,
             )
+        pad_parallel_draft_attn_metadata(
+            attn_metadata,
+            num_reqs=self.input_batch.num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_query_per_req=self.num_query_per_req,
+        )
         return [attn_metadata]
 
     def propose(

@@ -157,11 +157,12 @@ The 32-worker acceptance collapse tracked in
 `docs/domino_acceptance_batch_issue_2026-09-04.md` is a separate issue and
 should be re-tested after this fix.
 
-Update (2026-09-07): that acceptance issue is now resolved as well. With the
-draft windows capped to <=2048, the remaining graph-mode decay was caused by
-stale padded GDN/Mamba rows during target FULL-graph replay and was fixed in
-vllm-ascend `aa66a707e` (port of PR #15529's MTP/GDN metadata handling); see
-the acceptance log for details.
+Update (2026-09-09): the 2026-09-07 "resolved" note was too broad. The
+target-side GDN/Mamba padding fix (`aa66a707e`) remains necessary, but a
+full-attention draft A/B later showed that the remaining high-concurrency
+corruption is specific to the sliding-window draft's FIA replay metadata.
+The current fix restores the captured padded query/KV geometry for
+DFlash/DSpark/Domino; see the 2026-09-09 section in the acceptance log.
 
 ## Subsequent regression: do not reuse the main model's padded request count
 
