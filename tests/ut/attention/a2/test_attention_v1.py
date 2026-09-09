@@ -120,6 +120,17 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.assertFalse(result)
 
+    def test_group_has_sliding_window_layers_reads_layer_impl(self):
+        self.builder.layer_names = ["layer.0"]
+        layer = SimpleNamespace(impl=SimpleNamespace(sliding_window=1024))
+
+        with patch.object(
+            attn_module,
+            "get_layers_from_vllm_config",
+            return_value={"layer.0": layer},
+        ):
+            self.assertTrue(self.builder._group_has_sliding_window_layers())
+
     def test_unpadded_preserves_internal_seq_lens_cpu(self):
         internal_seq_lens_cpu = torch.tensor([4, 5, 6], dtype=torch.int32)
         common_attn_metadata = AscendCommonAttentionMetadata(

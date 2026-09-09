@@ -22,8 +22,13 @@ from typing import Any
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_layers_from_vllm_config,
+)
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -256,6 +261,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self._group_has_sliding_window: bool | None = None
 
     @classmethod
     def get_cudagraph_support(
@@ -296,6 +302,29 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         metadata here.
         """
         return {}
+
+    def _group_has_sliding_window_layers(self) -> bool:
+        """Whether any layer in this group applies a compute-time window.
+
+        Draft SWA layers deliberately share a full-attention KV cache group,
+        so the group spec does not carry the window.  FIA still needs the
+        non-masking band mask for those layers.
+        """
+        if self._group_has_sliding_window is None:
+            if not self.layer_names:
+                self._group_has_sliding_window = False
+            else:
+                layers = get_layers_from_vllm_config(
+                    self.vllm_config,
+                    AttentionLayerBase,
+                    self.layer_names,
+                )
+                self._group_has_sliding_window = any(
+                    getattr(getattr(layer, "impl", None), "sliding_window", None)
+                    is not None
+                    for layer in layers.values()
+                )
+        return self._group_has_sliding_window
 
     def build(
         self,
@@ -339,7 +368,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # layers (the causal mask would wrongly hide future positions).
         if (
             not common_attn_metadata.causal
-            and getattr(self.kv_cache_spec, "sliding_window", None) is not None
+            and self._group_has_sliding_window_layers()
         ):
             attn_mask = self.attn_mask_builder.get_band_attn_mask()
         else:

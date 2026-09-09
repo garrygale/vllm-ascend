@@ -35,6 +35,27 @@ class TestUtils(TestBase):
         importlib.reload(platform)
         utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
 
+    def test_refresh_block_size_preserves_shared_draft_cache_layout(self):
+        target_model = SimpleNamespace(is_hybrid=True)
+        draft_model = SimpleNamespace(is_hybrid=False)
+        cache_config = SimpleNamespace(
+            block_size=1536,
+            enable_prefix_caching=False,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=cache_config,
+            scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
+            model_config=draft_model,
+            speculative_config=SimpleNamespace(
+                draft_model_config=draft_model,
+                target_model_config=target_model,
+            ),
+        )
+
+        utils.refresh_block_size(vllm_config)
+
+        self.assertEqual(cache_config.block_size, 1536)
+
     def test_nd_to_nz_2d(self):
         # can be divided by 16
         input_tensor = torch.randn(32, 64)
