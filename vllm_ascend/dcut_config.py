@@ -71,7 +71,7 @@ class DcutConfig:
         if (
             "Qwen3ForCausalLM" not in (getattr(hf_config, "architectures", None) or [])
             or getattr(hf_config, "hidden_size", None) != 4096
-            or getattr(hf_config, "num_hidden_layers", None) != 32
+            or getattr(hf_config, "num_hidden_layers", None) != 36
         ):
             raise ValueError("D-Cut currently supports only Qwen3-8B")
         spec = vllm_config.speculative_config

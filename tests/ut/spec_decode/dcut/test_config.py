@@ -9,7 +9,7 @@ import pytest
 def vllm_config():
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"], hidden_size=4096, num_hidden_layers=32),
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"], hidden_size=4096, num_hidden_layers=36),
             enforce_eager=False,
         ),
         speculative_config=SimpleNamespace(
@@ -64,12 +64,19 @@ def test_supported_config_preserves_fixed_domino_block(dcut_modules):
     assert config.candidate_draft_lengths == (0, 1, 3)
 
 
-@pytest.mark.parametrize("unsupported", ["model", "method", "sampling", "block", "graph", "v1", "pp", "kv", "lora"])
+@pytest.mark.parametrize(
+    "unsupported",
+    ["model", "layers", "architecture", "method", "sampling", "block", "graph", "v1", "pp", "kv", "lora"],
+)
 def test_unsupported_model_or_execution_mode_is_rejected(dcut_modules, unsupported):
     config = dcut_modules.config.DcutConfig.from_dict({"enabled": True, "cost_table_path": "cost.json"})
     vconfig = vllm_config()
     if unsupported == "model":
         vconfig.model_config.hf_config.hidden_size = 2048
+    elif unsupported == "layers":
+        vconfig.model_config.hf_config.num_hidden_layers = 32
+    elif unsupported == "architecture":
+        vconfig.model_config.hf_config.architectures = ["Qwen2ForCausalLM"]
     elif unsupported == "method":
         vconfig.speculative_config.method = "dflash"
     elif unsupported == "sampling":
