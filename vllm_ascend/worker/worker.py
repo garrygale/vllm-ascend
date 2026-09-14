@@ -510,7 +510,12 @@ class NPUWorker(WorkerBase):
             logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
-            self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
+            if get_ascend_config().dcut_config.enabled is True:
+                from vllm_ascend.worker.v2.spec_decode.dcut.model_runner import DcutNPUModelRunner
+
+                self.model_runner = DcutNPUModelRunner(self.vllm_config, self.device)
+            else:
+                self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 

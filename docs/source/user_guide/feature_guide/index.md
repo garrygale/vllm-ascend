@@ -25,6 +25,7 @@ ucm_deployment
 Fine_grained_TP
 layer_sharding
 speculative_decoding
+domino_dcut
 context_parallel
 weight_prefetch
 sequence_parallelism

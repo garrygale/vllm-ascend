@@ -40,6 +40,11 @@ def init_speculator(
             AscendDominoSpeculator,
         )
 
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        if additional_config.get("dcut_config", {}).get("enabled", False) is True:
+            from vllm_ascend.worker.v2.spec_decode.dcut.speculator import DcutDominoSpeculator
+
+            return DcutDominoSpeculator(vllm_config, device)
         return AscendDominoSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
         from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
