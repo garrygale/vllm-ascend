@@ -27,18 +27,35 @@ def main():
     )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--context-tokens", type=int, default=512)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--candidate-draft-lengths", type=int, nargs="*", default=None)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--profile-warmup", type=int, default=2)
     parser.add_argument("--profile-samples", type=int, default=5)
     args = parser.parse_args()
     if args.disable_dcut and args.generate_cost_table:
         parser.error("--generate-cost-table requires D-Cut to be enabled")
-    if min(args.tp, args.batch_size, args.context_tokens, args.output_tokens, args.rounds) < 1:
+    max_num_seqs = args.max_num_seqs or args.batch_size
+    if min(args.tp, args.batch_size, max_num_seqs, args.context_tokens, args.output_tokens, args.rounds) < 1:
         parser.error("TP, batch size, context/output tokens and rounds must be positive")
+    if args.batch_size > max_num_seqs:
+        parser.error("--max-num-seqs must be greater than or equal to --batch-size")
+    if not 0 < args.gpu_memory_utilization <= 1:
+        parser.error("--gpu-memory-utilization must be in the interval (0, 1]")
+    if args.temperature < 0:
+        parser.error("--temperature must be nonnegative")
+    if not 0 < args.top_p <= 1:
+        parser.error("--top-p must be in the interval (0, 1]")
+    if args.candidate_draft_lengths is not None and any(length < 0 for length in args.candidate_draft_lengths):
+        parser.error("--candidate-draft-lengths values must be nonnegative")
 
     from transformers import AutoConfig
     from vllm import LLM, SamplingParams
@@ -56,28 +73,47 @@ def main():
         "profile_warmup": args.profile_warmup,
         "profile_samples": args.profile_samples,
     }
+    if args.candidate_draft_lengths is not None:
+        dcut_config["candidate_draft_lengths"] = args.candidate_draft_lengths
     llm = LLM(
         model=args.target_model,
         tensor_parallel_size=args.tp,
         max_model_len=args.max_model_len,
-        max_num_seqs=args.batch_size,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
         async_scheduling=True,
+        trust_remote_code=True,
         speculative_config={
             "model": args.draft_model,
             "method": "domino",
             "draft_sample_method": "greedy",
             "num_speculative_tokens": block_size,
+            "draft_tensor_parallel_size": args.tp,
         },
-        compilation_config={"mode": "VLLM_COMPILE", "cudagraph_mode": "PIECEWISE"},
-        additional_config={"dcut_config": dcut_config},
+        compilation_config={
+            "mode": "VLLM_COMPILE",
+            "cudagraph_mode": "PIECEWISE",
+            "cudagraph_capture_sizes": [1, 4, 8, 12, 16, 64, 256, 512, 768, 1024],
+        },
+        additional_config={
+            "enable_cpu_binding": True,
+            "enable_weight_nz_layout": True,
+            "dcut_config": dcut_config,
+        },
     )
     tokenizer = llm.get_tokenizer()
     unit = tokenizer.encode("Explain how a computer processes information. ", add_special_tokens=False)
     tokens = (unit * (args.context_tokens // len(unit) + 1))[: args.context_tokens]
     prompts = [{"prompt_token_ids": tokens} for _ in range(args.batch_size)]
-    sampling = SamplingParams(temperature=0, max_tokens=args.output_tokens, ignore_eos=True)
+    sampling = SamplingParams(
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        max_tokens=args.output_tokens,
+        ignore_eos=True,
+    )
     generated = 0
     elapsed = 0.0
     for _ in range(args.rounds):

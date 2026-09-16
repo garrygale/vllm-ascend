@@ -38,6 +38,12 @@ def vllm_config():
         {"min_gain": float("nan")},
         {"min_gain": -0.1},
         {"candidate_draft_lengths": [1.5]},
+        {"candidate_ratios": []},
+        {"candidate_ratios": [0]},
+        {"candidate_ratios": [1.1]},
+        {"candidate_ratios": [float("nan")]},
+        {"candidate_ratios": [True]},
+        {"candidate_ratios": "invalid"},
         {"context_buckets": []},
         {"context_buckets": [0]},
         {"unknown": 1},
@@ -57,10 +63,12 @@ def test_supported_config_preserves_fixed_domino_block(dcut_modules):
         {
             "enabled": True,
             "cost_table_path": "cost.json",
+            "candidate_ratios": [1, 0.5, 0.25, 0.5],
             "candidate_draft_lengths": [3, 0, 1, 1],
         }
     )
     config.validate_model(vllm_config())
+    assert config.candidate_ratios == (0.25, 0.5, 1.0)
     assert config.candidate_draft_lengths == (0, 1, 3)
 
 
@@ -104,6 +112,7 @@ def test_disabled_feature_ignores_all_inactive_options(dcut_modules, enabled):
         "cost_table_path": None,
         "profile_samples": 0,
         "min_gain": float("nan"),
+        "candidate_ratios": "invalid",
         "candidate_draft_lengths": "invalid",
         "unused_option": object(),
     }

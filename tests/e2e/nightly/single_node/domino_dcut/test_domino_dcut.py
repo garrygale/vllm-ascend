@@ -70,8 +70,12 @@ def test_domino_dcut_piecewise_v2(tmp_path, request):
     # These synthetic timings are only for correctness coverage, never a benchmark.
     for row in table["rows"]:
         anchor_only = row["query_tokens"] == row["batch_size"]
-        row["target_ms"] = 0.01 if anchor_only else 1000.0
-        row["draft_ms"] = 0.01 if anchor_only else 1000.0
+        row["step_ms"] = 1.0 if anchor_only else 1000.0
+        row["target_ms"] = 0.4 if anchor_only else 400.0
+        row["draft_ms"] = 0.4 if anchor_only else 400.0
+        row["overhead_ms"] = max(
+            0.0, row["step_ms"] - row["target_ms"] - row["draft_ms"]
+        )
     path.write_text(json.dumps(table))
     before = path.read_bytes()
     trimmed, stats = run(True, False)

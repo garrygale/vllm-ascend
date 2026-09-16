@@ -12,6 +12,7 @@ class DcutConfig:
     enabled: bool = False
     cost_table_path: str = ""
     generate_cost_table: bool = False
+    candidate_ratios: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     candidate_draft_lengths: tuple[int, ...] = ()
     context_buckets: tuple[int, ...] = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
     profile_warmup: int = 2
@@ -42,6 +43,13 @@ class DcutConfig:
                 if not isinstance(items, (list, tuple)) or any(type(item) is not int for item in items):
                     raise ValueError(f"dcut_config.{name} must be a list of integers")
                 values[name] = tuple(sorted(set(items)))
+        if "candidate_ratios" in values:
+            ratios = values["candidate_ratios"]
+            if not isinstance(ratios, (list, tuple)) or any(
+                isinstance(ratio, bool) or not isinstance(ratio, (float, int)) for ratio in ratios
+            ):
+                raise ValueError("dcut_config.candidate_ratios must be a list of numbers")
+            values["candidate_ratios"] = tuple(sorted(set(float(ratio) for ratio in ratios)))
         config = cls(**values)
         if not isinstance(config.cost_table_path, str):
             raise ValueError("dcut_config.cost_table_path must be a string")
@@ -61,6 +69,13 @@ class DcutConfig:
             raise ValueError("context_buckets must contain positive integers")
         if config.candidate_draft_lengths and config.candidate_draft_lengths[0] < 0:
             raise ValueError("candidate_draft_lengths must be nonnegative")
+        if (
+            not config.candidate_ratios
+            or config.candidate_ratios[0] <= 0
+            or config.candidate_ratios[-1] > 1
+            or not all(math.isfinite(ratio) for ratio in config.candidate_ratios)
+        ):
+            raise ValueError("candidate_ratios must contain finite values in (0, 1]")
         return config
 
     def validate_model(self, vllm_config: Any) -> None:

@@ -124,6 +124,9 @@ class CorrectionModel:
     def domino_optimized_cell(self, draft_i, hidden, gh):
         return hidden
 
+    def map_draft_to_target(self, draft_ids):
+        return draft_ids + 10
+
 
 def test_probability_uses_gru_corrected_logits_without_changing_full_block(dcut_modules):
     baseline_cls = production_methods(

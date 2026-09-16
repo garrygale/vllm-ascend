@@ -65,7 +65,14 @@ class FakeTp:
         return self.bus["message"]
 
 
-def runtime_for(modules, tmp_path, generate=False, bus=None, rank=0, wait_for_probs=True):
+def table_fingerprint(config):
+    return {
+        "device": "test",
+        "context_buckets": list(config.context_buckets),
+    }
+
+
+def runtime_for(modules, tmp_path, generate=False, bus=None, rank=0, wait_for_probs=True, flat_cost=False):
     config = modules.config.DcutConfig.from_dict(
         {
             "enabled": True,
@@ -77,29 +84,41 @@ def runtime_for(modules, tmp_path, generate=False, bus=None, rank=0, wait_for_pr
         }
     )
     if not generate and rank == 0:
-        table = modules.controller.CostTable({"device": "test", "context_buckets": list(config.context_buckets)})
-        table.rows[modules.controller.CostKey(2, 256, 8)] = modules.controller.Cost(10, 1, 5)
-        table.rows[modules.controller.CostKey(2, 256, 4)] = modules.controller.Cost(2, 1, 5)
+        table = modules.controller.CostTable(table_fingerprint(config))
+        table.rows[modules.controller.CostKey(2, 256, 8)] = modules.controller.Cost(11, 10, 1, 5)
+        short_step = 10.9 if flat_cost else 3
+        table.rows[modules.controller.CostKey(2, 256, 4)] = modules.controller.Cost(short_step, 2, 1, 5)
         table.save(config.cost_table_path)
     return modules.runtime.DcutRuntime(
         config, {"device": "test"}, 4, 3, torch.device("cpu"), FakeTp(bus if bus is not None else {}, rank), FakeNpu()
     )
 
 
+def enable_capture(runtime):
+    runtime.select_caps(ScheduledBatch(), request_states())
+    assert runtime.capture_requested
+
+
 def proposal(runtime, values, req_ids=("a", "b")):
+    if not runtime.config.generate_cost_table and not runtime.capture_requested:
+        enable_capture(runtime)
     assert runtime.begin_proposal(False, False)
     runtime.end_proposal(SimpleNamespace(num_reqs=len(req_ids), req_ids=list(req_ids)), torch.tensor(values))
 
 
-def test_selected_probability_matches_softmax_with_extreme_logits(dcut_modules):
+def test_selected_probability_gathers_already_selected_ids(dcut_modules):
     logits = torch.tensor([[1000.0, 999.0, -float("inf")], [-1000.0, -999.0, -998.0]])
-    actual = dcut_modules.runtime.selected_greedy_probability(logits)
-    expected = logits.softmax(-1).amax(-1)
+    selected_ids = torch.tensor([0, 1])
+    actual = dcut_modules.runtime.selected_greedy_probability(logits, selected_ids)
+    expected = logits.softmax(-1).gather(-1, selected_ids[:, None]).squeeze(-1)
     torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="batch dimensions"):
+        dcut_modules.runtime.selected_greedy_probability(logits, selected_ids[:, None])
 
 
 def test_transfer_reorders_requests_and_is_consumed_once(dcut_modules, tmp_path):
     runtime = runtime_for(dcut_modules, tmp_path)
+    enable_capture(runtime)
     source = torch.tensor([[0.1] * 3, [0.9] * 3])
     assert runtime.begin_proposal(False, False)
     runtime.end_proposal(SimpleNamespace(num_reqs=2, req_ids=["b", "a"]), source)
@@ -127,10 +146,25 @@ def test_changed_request_set_never_uses_stale_probability(dcut_modules, tmp_path
     assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
 
 
-def test_tp_peers_apply_root_caps_without_probability_copy(dcut_modules, tmp_path):
+def test_cost_gate_skips_capture_for_flat_small_batch(dcut_modules, tmp_path):
+    runtime = runtime_for(dcut_modules, tmp_path, flat_cost=True)
+    runtime.snapshot_req_ids = ["a", "b"]  # Simulate a copy requested before a tail transition.
+    runtime.copy_event.ready = False
+    assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
+    assert not runtime.capture_requested
+    assert not runtime.begin_proposal(False, False)
+    assert runtime.stats["capture_skips"] == 1
+    assert runtime.snapshot_req_ids is None
+    assert runtime.copy_event.waits == 0
+
+
+def test_tp_peers_apply_root_caps_and_capture_gate(dcut_modules, tmp_path):
     bus = {}
     root = runtime_for(dcut_modules, tmp_path, bus=bus)
     peer = runtime_for(dcut_modules, tmp_path, bus=bus, rank=1)
+    enable_capture(root)
+    peer.select_caps(ScheduledBatch(), request_states())
+    assert peer.capture_requested
     proposal(root, [[0.9] * 3, [0.1] * 3])
     root_ids, root_caps = root.select_caps(ScheduledBatch(), request_states())
     peer_ids, peer_caps = peer.select_caps(ScheduledBatch(), request_states())
@@ -141,18 +175,77 @@ def test_tp_peers_apply_root_caps_without_probability_copy(dcut_modules, tmp_pat
     assert not peer.begin_proposal(False, False)
 
 
-def test_generation_profiles_baseline_then_shorter_budget(dcut_modules, tmp_path):
+def test_generation_rebuilds_mismatched_table(dcut_modules, tmp_path):
+    config = dcut_modules.config.DcutConfig.from_dict(
+        {
+            "enabled": True,
+            "cost_table_path": str(tmp_path / "cost.json"),
+            "generate_cost_table": True,
+        }
+    )
+    stale = dcut_modules.controller.CostTable(
+        {"device": "stale", "context_buckets": list(config.context_buckets)}
+    )
+    stale.rows[dcut_modules.controller.CostKey(1, 256, 4)] = dcut_modules.controller.Cost(3, 1, 1, 1)
+    stale.save(config.cost_table_path)
+
+    runtime = dcut_modules.runtime.DcutRuntime(
+        config, {"device": "test"}, 4, 3, torch.device("cpu"), FakeTp({}, 0), FakeNpu()
+    )
+
+    assert runtime.table.fingerprint == table_fingerprint(config)
+    assert runtime.table.rows == {}
+    assert dcut_modules.controller.CostTable.load(config.cost_table_path, table_fingerprint(config)).rows == {}
+
+
+def test_inference_rejects_mismatched_table(dcut_modules, tmp_path):
+    config = dcut_modules.config.DcutConfig.from_dict(
+        {
+            "enabled": True,
+            "cost_table_path": str(tmp_path / "cost.json"),
+            "generate_cost_table": False,
+        }
+    )
+    stale = dcut_modules.controller.CostTable(
+        {"device": "stale", "context_buckets": list(config.context_buckets)}
+    )
+    stale.save(config.cost_table_path)
+
+    with pytest.raises(ValueError, match="does not match"):
+        dcut_modules.runtime.DcutRuntime(
+            config, {"device": "test"}, 4, 3, torch.device("cpu"), FakeTp({}, 0), FakeNpu()
+        )
+
+def test_generation_profiles_baseline_then_ratio_budget(dcut_modules, tmp_path):
     runtime = runtime_for(dcut_modules, tmp_path, generate=True)
     req_ids, caps = runtime.select_caps(ScheduledBatch(), request_states())
     assert caps.tolist() == [3, 3]
+    assert runtime.capture_requested
     runtime.begin_target()
     proposal(runtime, [[0.9] * 3, [0.1] * 3])
     req_ids, caps = runtime.select_caps(ScheduledBatch(), request_states())
     assert caps.tolist() == [2, 2]
     key = dcut_modules.controller.CostKey(2, 256, 8)
     assert key in runtime.table.rows
+    assert runtime.table.rows[key].step_ms > 0
     assert runtime.stats["profiled_rows"] == 1
     assert dcut_modules.controller.CostTable.load(runtime.config.cost_table_path, runtime.table.fingerprint).rows
+
+
+def test_step_cost_uses_steady_state_wall_time(dcut_modules, tmp_path, monkeypatch):
+    ticks = iter((10.0, 10.012))
+    monkeypatch.setattr(dcut_modules.runtime.time, "perf_counter", lambda: next(ticks))
+    runtime = runtime_for(dcut_modules, tmp_path, generate=True)
+    runtime.select_caps(ScheduledBatch(), request_states())
+    runtime.begin_target()
+    proposal(runtime, [[0.9] * 3, [0.1] * 3])
+    runtime.copy_event.ready = False
+    runtime.finish_calibration()
+    cost = runtime.table.rows[dcut_modules.controller.CostKey(2, 256, 8)]
+    assert cost.step_ms == pytest.approx(12)
+    assert cost.target_ms == 1
+    assert cost.draft_ms == 1
+    assert runtime.copy_event.waits == 1
 
 
 def test_dummy_proposal_does_not_copy_or_profile(dcut_modules, tmp_path):
@@ -203,7 +296,7 @@ def test_completed_calibration_shapes_do_not_create_timing_events(dcut_modules, 
     runtime = runtime_for(dcut_modules, tmp_path, generate=True)
     c = dcut_modules.controller
     for query in (2, 4, 6, 8):
-        runtime.table.rows[c.CostKey(2, 256, query)] = c.Cost(1, 1, 1)
+        runtime.table.rows[c.CostKey(2, 256, query)] = c.Cost(3, 1, 1, 1)
     runtime.select_caps(ScheduledBatch(), request_states())
     runtime.begin_target()
     assert runtime.current_key is runtime.target_start is None

@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-TABLE_VERSION = 1
+TABLE_VERSION = 2
 
 
 @dataclass(frozen=True, order=True)
@@ -26,20 +26,23 @@ class CostKey:
 
 @dataclass(frozen=True)
 class Cost:
+    """Steady-state speculative-step cost plus diagnostic NPU components."""
+
+    step_ms: float
     target_ms: float
     draft_ms: float
     samples: int
 
     @property
-    def total_ms(self) -> float:
-        return self.target_ms + self.draft_ms
+    def overhead_ms(self) -> float:
+        return max(0.0, self.step_ms - self.target_ms - self.draft_ms)
 
 
 class CostTable:
     def __init__(self, fingerprint: dict[str, Any]):
         self.fingerprint = fingerprint
         self.rows: dict[CostKey, Cost] = {}
-        self.observations: dict[CostKey, list[tuple[float, float]]] = {}
+        self.observations: dict[CostKey, list[tuple[float, float, float]]] = {}
 
     @classmethod
     def load(cls, path: str, fingerprint: dict[str, Any]) -> "CostTable":
@@ -59,13 +62,17 @@ class CostTable:
             batch, context, query, samples = dimensions
             if query < batch:
                 raise ValueError("D-Cut query_tokens must include one anchor per request")
-            target, draft = float(row["target_ms"]), float(row["draft_ms"])
-            if not all(math.isfinite(value) and value > 0 for value in (target, draft)):
-                raise ValueError("D-Cut cost timings must be finite and positive")
+            step = float(row["step_ms"])
+            target = float(row["target_ms"])
+            draft = float(row["draft_ms"])
+            if not math.isfinite(step) or step <= 0:
+                raise ValueError("D-Cut step_ms must be finite and positive")
+            if not all(math.isfinite(value) and value >= 0 for value in (target, draft)):
+                raise ValueError("D-Cut diagnostic timings must be finite and nonnegative")
             key = CostKey(batch, context, query)
             if key in table.rows:
                 raise ValueError("Duplicate D-Cut cost table row")
-            table.rows[key] = Cost(target, draft, samples)
+            table.rows[key] = Cost(step, target, draft, samples)
         return table
 
     def save(self, path: str) -> None:
@@ -76,8 +83,10 @@ class CostTable:
                 "batch_size": key.batch_size,
                 "context_bucket": key.context_bucket,
                 "query_tokens": key.query_tokens,
+                "step_ms": cost.step_ms,
                 "target_ms": cost.target_ms,
                 "draft_ms": cost.draft_ms,
+                "overhead_ms": cost.overhead_ms,
                 "samples": cost.samples,
             }
             for key, cost in sorted(self.rows.items())
@@ -92,17 +101,32 @@ class CostTable:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def observe(self, key: CostKey, target_ms: float, draft_ms: float, warmup: int, samples: int) -> bool:
-        if key in self.rows or not all(math.isfinite(value) and value > 0 for value in (target_ms, draft_ms)):
+    def observe(
+        self,
+        key: CostKey,
+        step_ms: float,
+        target_ms: float,
+        draft_ms: float,
+        warmup: int,
+        samples: int,
+    ) -> bool:
+        timings = (step_ms, target_ms, draft_ms)
+        if (
+            key in self.rows
+            or not math.isfinite(step_ms)
+            or step_ms <= 0
+            or not all(math.isfinite(value) and value >= 0 for value in (target_ms, draft_ms))
+        ):
             return False
         observations = self.observations.setdefault(key, [])
-        observations.append((target_ms, draft_ms))
+        observations.append(timings)
         if len(observations) < warmup + samples:
             return False
         observations = observations[warmup:]
         self.rows[key] = Cost(
-            statistics.median(pair[0] for pair in observations),
-            statistics.median(pair[1] for pair in observations),
+            statistics.median(sample[0] for sample in observations),
+            statistics.median(sample[1] for sample in observations),
+            statistics.median(sample[2] for sample in observations),
             len(observations),
         )
         del self.observations[key]
@@ -114,11 +138,17 @@ def context_bucket(context_length: int, buckets: tuple[int, ...]) -> int | None:
     return buckets[index] if index < len(buckets) else None
 
 
-def query_budgets(limits: np.ndarray, draft_lengths: tuple[int, ...]) -> list[int]:
+def query_budgets(
+    limits: np.ndarray,
+    ratios: tuple[float, ...],
+    draft_lengths: tuple[int, ...] = (),
+) -> list[int]:
+    """Return paper-style total-token ratio buckets plus optional explicit depths."""
     batch = len(limits)
     full = batch + int(limits.sum())
-    candidates = {batch + int(np.minimum(limits, length).sum()) for length in draft_lengths}
-    # Establish the full-K baseline before measuring shorter prefixes.
+    candidates = {max(batch, min(full, math.ceil(ratio * full))) for ratio in ratios}
+    candidates.update(batch + int(np.minimum(limits, length).sum()) for length in draft_lengths)
+    # Establish the full-K baseline before measuring shorter budgets.
     return [full, *sorted(candidates - {full}, reverse=True)]
 
 
@@ -131,6 +161,27 @@ def allocate_prefixes(gains: np.ndarray, limits: np.ndarray, draft_budget: int) 
     masked = np.where(np.arange(gains.shape[1])[None, :] < limits[:, None], gains, -np.inf)
     selected = np.argsort(-masked.ravel(), kind="stable")[:draft_budget]
     return np.bincount(selected // gains.shape[1], minlength=len(limits)).astype(np.int32)
+
+
+def has_viable_budget(
+    limits: np.ndarray,
+    table: CostTable,
+    bucket: int,
+    min_gain: float,
+) -> bool:
+    """Whether any shorter cost row can possibly clear the decision threshold."""
+    batch = len(limits)
+    full = batch + int(limits.sum())
+    baseline = table.rows.get(CostKey(batch, bucket, full))
+    if baseline is None:
+        return False
+    return any(
+        key.batch_size == batch
+        and key.context_bucket == bucket
+        and batch <= key.query_tokens < full
+        and baseline.step_ms > cost.step_ms * (1 + min_gain)
+        for key, cost in table.rows.items()
+    )
 
 
 def choose_caps(
@@ -156,7 +207,7 @@ def choose_caps(
         return None
     gains = np.cumprod(probabilities.astype(np.float64), axis=1)
     mask = np.arange(gains.shape[1])[None, :] < limits[:, None]
-    baseline_score = (batch + gains[mask].sum()) / baseline_cost.total_ms
+    baseline_score = (batch + gains[mask].sum()) / baseline_cost.step_ms
     best_score = baseline_score
     best_caps = limits.copy()
     for key, cost in sorted(table.rows.items()):
@@ -164,7 +215,7 @@ def choose_caps(
             continue
         caps = allocate_prefixes(gains, limits, key.query_tokens - batch)
         kept = np.arange(gains.shape[1])[None, :] < caps[:, None]
-        score = (batch + gains[kept].sum()) / cost.total_ms
+        score = (batch + gains[kept].sum()) / cost.step_ms
         if score > best_score and score > baseline_score * (1 + min_gain):
             best_score, best_caps = score, caps
     return best_caps

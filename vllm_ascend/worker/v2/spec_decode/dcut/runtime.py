@@ -4,23 +4,34 @@
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from .controller import CostKey, CostTable, allocate_prefixes, choose_caps, decode_batch_info, query_budgets
+from .controller import (
+    CostKey,
+    CostTable,
+    allocate_prefixes,
+    choose_caps,
+    decode_batch_info,
+    has_viable_budget,
+    query_budgets,
+)
 
 # Reuse the configured vLLM namespace without initializing an engine in CPU tests.
 logger = logging.getLogger("vllm")
 
 
-def selected_greedy_probability(logits: torch.Tensor) -> torch.Tensor:
-    """Selected draft-vocabulary probability before draft-to-target mapping."""
+def selected_greedy_probability(logits: torch.Tensor, selected_ids: torch.Tensor) -> torch.Tensor:
+    """Probability of already selected draft-vocabulary IDs."""
+    if selected_ids.shape != logits.shape[:-1]:
+        raise ValueError("selected_ids must match the logits batch dimensions")
     logits_fp32 = logits.float()
-    shifted = logits_fp32 - logits_fp32.amax(dim=-1, keepdim=True)
-    return (-torch.logsumexp(shifted, dim=-1)).exp()
+    selected_logits = logits_fp32.gather(-1, selected_ids.unsqueeze(-1)).squeeze(-1)
+    return (selected_logits - torch.logsumexp(logits_fp32, dim=-1)).exp()
 
 
 def model_fingerprint(vllm_config: Any, device_name: str) -> dict[str, Any]:
@@ -49,6 +60,7 @@ def model_fingerprint(vllm_config: Any, device_name: str) -> dict[str, Any]:
         "capture_sizes": list(vllm_config.compilation_config.cudagraph_capture_sizes or []),
         "target_graph_mode": "PIECEWISE",
         "draft_graph_mode": "NONE",
+        "cost_metric": "steady_state_end_to_end_step_ms_v2",
     }
 
 
@@ -78,9 +90,18 @@ class DcutRuntime:
         self.draft_start: Any = None
         self.draft_end: Any = None
         self.measurement_key: CostKey | None = None
+        self.measurement_started_at: float | None = None
         self.current_key: CostKey | None = None
+        self.current_started_at: float | None = None
+        self.capture_requested = False
         self.collecting = False
-        self.stats = {"decisions": 0, "trimmed_tokens": 0, "fallbacks": 0, "profiled_rows": 0}
+        self.stats = {
+            "decisions": 0,
+            "trimmed_tokens": 0,
+            "fallbacks": 0,
+            "capture_skips": 0,
+            "profiled_rows": 0,
+        }
         error = None
         if self.is_root:
             try:
@@ -88,7 +109,14 @@ class DcutRuntime:
                 fingerprint["context_buckets"] = list(config.context_buckets)
                 path = Path(config.cost_table_path)
                 if path.exists():
-                    self.table = CostTable.load(str(path), fingerprint)
+                    try:
+                        self.table = CostTable.load(str(path), fingerprint)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        if not config.generate_cost_table:
+                            raise
+                        logger.warning("D-Cut cost table is stale; rebuilding it for the current configuration: %s", exc)
+                        self.table = CostTable(fingerprint)
+                        self.table.save(str(path))
                 elif config.generate_cost_table:
                     self.table = CostTable(fingerprint)
                     self.table.save(str(path))
@@ -113,28 +141,38 @@ class DcutRuntime:
             )
 
     def _consume_measurement(self) -> None:
-        if self.measurement_key is None or self.draft_end is None:
+        if self.measurement_key is None or self.measurement_started_at is None or self.draft_end is None:
             return
         if not self.draft_end.query():
-            # Deliberate synchronization only while generating the cost table.
+            # Synchronize only while generating the table. Wall time then includes
+            # any device work that was still on the serving critical path.
             self.draft_end.synchronize()
+        if self.copy_event is not None and not self.copy_event.query():
+            # Attribute the selected-probability transfer and its required wait to
+            # the step that produced it instead of shifting that cost to the next row.
+            self.copy_event.synchronize()
+        step_ms = (time.perf_counter() - self.measurement_started_at) * 1000
+        target_ms = self.target_start.elapsed_time(self.draft_start)
+        draft_ms = self.draft_start.elapsed_time(self.draft_end)
         assert self.table is not None
         try:
             completed = self.table.observe(
                 self.measurement_key,
-                self.target_start.elapsed_time(self.draft_start),
-                self.draft_start.elapsed_time(self.draft_end),
+                step_ms,
+                target_ms,
+                draft_ms,
                 self.config.profile_warmup,
                 self.config.profile_samples,
             )
             if completed:
                 self.table.save(self.config.cost_table_path)
                 self.stats["profiled_rows"] += 1
-                logger.info("D-Cut calibrated cost row %s", self.measurement_key)
+                logger.info("D-Cut calibrated end-to-end cost row %s", self.measurement_key)
         except OSError as exc:
             logger.warning("D-Cut could not save cost table: %s", exc)
         finally:
             self.measurement_key = None
+            self.measurement_started_at = None
             self.target_start = self.draft_start = self.draft_end = None
 
     def finish_calibration(self) -> dict[str, int]:
@@ -160,30 +198,45 @@ class DcutRuntime:
     def select_caps(self, scheduler_output: Any, req_states: Any) -> tuple[list[str], np.ndarray | None]:
         """Rank zero decides, including readiness/fallback, before graph dispatch."""
         self.current_key = None
+        self.current_started_at = None
         decision: Any = None
+        step_started_at = None
         if self.is_root:
             self._consume_measurement()
+            step_started_at = time.perf_counter()
             info = decode_batch_info(scheduler_output, req_states, self.config.context_buckets)
             if info is None:
                 self.snapshot_req_ids = None
-                decision = ([], None, None)
+                decision = ([], None, None, False, False)
             else:
                 req_ids, bucket = info
                 limits = np.array(
                     [len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])) for req_id in req_ids],
                     dtype=np.int32,
                 )
-                probabilities = self._take_probabilities(req_ids)
                 caps = None
+                eligible = bool(np.all(limits <= self.block_size))
                 assert self.table is not None
-                if np.all(limits <= self.block_size):
+                capture = eligible and (
+                    self.config.generate_cost_table
+                    or has_viable_budget(limits, self.table, bucket, self.config.min_gain)
+                )
+                if capture:
+                    probabilities = self._take_probabilities(req_ids)
+                else:
+                    # A previous shape may have requested a copy. The current
+                    # cost bound proves it cannot help, so discard it without waiting.
+                    self.snapshot_req_ids = None
+                    probabilities = None
+                if eligible:
                     if self.config.generate_cost_table:
-                        lengths = self.config.candidate_draft_lengths or tuple(
-                            sorted({0, 1, min(2, self.block_size), min(4, self.block_size), self.block_size})
-                        )
-                        for budget in query_budgets(limits, lengths):
+                        for budget in query_budgets(
+                            limits,
+                            self.config.candidate_ratios,
+                            self.config.candidate_draft_lengths,
+                        ):
                             if CostKey(len(req_ids), bucket, budget) not in self.table.rows:
-                                # Balanced prefixes measure shapes without using probability estimates.
+                                # Balanced prefixes measure shapes without depending on confidence.
                                 gains = np.broadcast_to(
                                     -np.arange(self.block_size, dtype=np.float64), (len(req_ids), self.block_size)
                                 )
@@ -191,8 +244,9 @@ class DcutRuntime:
                                 break
                     if caps is None and probabilities is not None:
                         caps = choose_caps(probabilities, limits, self.table, bucket, self.config.min_gain)
-                decision = (req_ids, caps.tolist() if caps is not None else None, bucket)
-        req_ids, caps_list, bucket = self.tp_group.broadcast_object(decision, src=0)
+                decision = (req_ids, caps.tolist() if caps is not None else None, bucket, capture, eligible)
+        req_ids, caps_list, bucket, capture, eligible = self.tp_group.broadcast_object(decision, src=0)
+        self.capture_requested = bool(capture)
         caps = np.array(caps_list, dtype=np.int32) if caps_list is not None else None
         if caps is None:
             self.stats["fallbacks"] += 1
@@ -204,6 +258,8 @@ class DcutRuntime:
             if removed:
                 self.stats["decisions"] += 1
                 self.stats["trimmed_tokens"] += removed
+        if eligible and not self.config.generate_cost_table and not capture:
+            self.stats["capture_skips"] += 1
         if self.is_root and self.config.generate_cost_table and bucket is not None:
             total = len(req_ids) + (
                 int(caps.sum())
@@ -214,21 +270,27 @@ class DcutRuntime:
             assert self.table is not None
             if key not in self.table.rows:
                 self.current_key = key
+                self.current_started_at = step_started_at
         return req_ids, caps
 
     def begin_target(self) -> None:
         if self.current_key is not None:
+            if self.current_started_at is None:
+                raise RuntimeError("D-Cut cost measurement has no step start")
             self.target_start = self.npu.Event(enable_timing=True)
             self.target_start.record()
 
     def abort_target(self) -> None:
         self.current_key = self.measurement_key = None
+        self.current_started_at = self.measurement_started_at = None
         self.target_start = self.draft_start = self.draft_end = None
         self.snapshot_req_ids = None
+        self.capture_requested = False
         self.collecting = False
 
     def begin_proposal(self, dummy_run: bool, is_profile: bool) -> bool:
-        self.collecting = self.is_root and not dummy_run and not is_profile
+        should_capture = self.config.generate_cost_table or self.capture_requested
+        self.collecting = self.is_root and should_capture and not dummy_run and not is_profile
         if self.collecting and self.current_key is not None:
             self.draft_start = self.npu.Event(enable_timing=True)
             self.draft_start.record()
@@ -242,7 +304,9 @@ class DcutRuntime:
             self.draft_end = self.npu.Event(enable_timing=True)
             self.draft_end.record()
             self.measurement_key = self.current_key
+            self.measurement_started_at = self.current_started_at
             self.current_key = None
+            self.current_started_at = None
         # A staging clone avoids a race with the next proposal overwriting its buffer.
         staging = probabilities[: input_batch.num_reqs].clone()
         self.copy_stream.wait_stream(self.npu.current_stream())

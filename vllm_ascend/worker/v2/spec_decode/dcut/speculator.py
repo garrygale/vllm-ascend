@@ -30,10 +30,18 @@ class DcutDominoSpeculator(AscendDominoSpeculator):
     def _sample_step(
         self, logits_i: torch.Tensor, idx_map_i: torch.Tensor, sample_pos_i: torch.Tensor, col: int
     ) -> torch.Tensor:
-        if self._collect_dcut_probs:
-            assert self.selected_probs is not None
-            self.selected_probs[: logits_i.shape[0], col].copy_(selected_greedy_probability(logits_i))
-        return super()._sample_step(logits_i, idx_map_i, sample_pos_i, col)
+        if not self._collect_dcut_probs:
+            return super()._sample_step(logits_i, idx_map_i, sample_pos_i, col)
+        if getattr(self, "draft_logits", None) is not None:
+            raise RuntimeError("D-Cut argmax reuse requires greedy Domino sampling")
+        assert self.selected_probs is not None
+        # Select once in draft vocabulary space, reuse the IDs both for the
+        # probability gather and for the original draft-to-target mapping.
+        selected_ids = logits_i.argmax(dim=-1)
+        self.selected_probs[: logits_i.shape[0], col].copy_(
+            selected_greedy_probability(logits_i, selected_ids)
+        )
+        return self.model.map_draft_to_target(selected_ids)
 
     def propose(
         self,

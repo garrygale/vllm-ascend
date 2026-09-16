@@ -32,8 +32,8 @@ def request_states():
 
 def make_table(controller):
     table = controller.CostTable({"device": "test"})
-    table.rows[controller.CostKey(2, 256, 8)] = controller.Cost(10.0, 1.0, 5)
-    table.rows[controller.CostKey(2, 256, 4)] = controller.Cost(2.0, 1.0, 5)
+    table.rows[controller.CostKey(2, 256, 8)] = controller.Cost(11.0, 10.0, 1.0, 5)
+    table.rows[controller.CostKey(2, 256, 4)] = controller.Cost(3.0, 2.0, 1.0, 5)
     return table
 
 
@@ -84,6 +84,16 @@ def test_unprofiled_context_or_full_baseline_falls_back(dcut_modules):
     assert c.choose_caps(np.full((2, 3), 0.9), np.array([3, 3]), table, 512, 0) is None
     del table.rows[c.CostKey(2, 256, 8)]
     assert c.choose_caps(np.full((2, 3), 0.9), np.array([3, 3]), table, 256, 0) is None
+
+
+def test_capture_gate_uses_cost_upper_bound(dcut_modules):
+    c = dcut_modules.controller
+    limits = np.array([3, 3])
+    table = make_table(c)
+    assert c.has_viable_budget(limits, table, 256, min_gain=0.02)
+    table.rows[c.CostKey(2, 256, 4)] = c.Cost(10.9, 9.9, 1.0, 5)
+    assert not c.has_viable_budget(limits, table, 256, min_gain=0.02)
+    assert not c.has_viable_budget(limits, table, 512, min_gain=0.02)
 
 
 def test_prefix_truncation_preserves_original_and_scheduler_accounting(dcut_modules):
@@ -137,18 +147,21 @@ def test_context_and_calibration_query_budgets(dcut_modules):
     c = dcut_modules.controller
     assert c.context_bucket(257, (256, 512)) == 512
     assert c.context_bucket(513, (256, 512)) is None
-    assert c.query_budgets(np.array([3, 2]), (0, 1, 2, 3)) == [7, 6, 4, 2]
+    limits = np.array([3, 2])
+    assert c.query_budgets(limits, (0.25, 0.5, 0.75, 1.0)) == [7, 6, 4, 2]
+    assert c.query_budgets(limits, (0.5, 1.0), (0, 2)) == [7, 6, 4, 2]
 
 
 def test_table_warmup_median_and_roundtrip(dcut_modules, tmp_path):
     c = dcut_modules.controller
     table = c.CostTable({"device": "test"})
     key = c.CostKey(2, 256, 4)
-    assert not table.observe(key, 99, 99, warmup=1, samples=3)
-    assert not table.observe(key, 2, 1, warmup=1, samples=3)
-    assert not table.observe(key, 100, 100, warmup=1, samples=3)
-    assert table.observe(key, 3, 2, warmup=1, samples=3)
-    assert table.rows[key] == c.Cost(3, 2, 3)
+    assert not table.observe(key, 99, 9, 9, warmup=1, samples=3)
+    assert not table.observe(key, 3, 2, 1, warmup=1, samples=3)
+    assert not table.observe(key, 100, 10, 10, warmup=1, samples=3)
+    assert table.observe(key, 5, 4, 2, warmup=1, samples=3)
+    assert table.rows[key] == c.Cost(5, 4, 2, 3)
+    assert table.rows[key].overhead_ms == 0
     path = str(tmp_path / "table.json")
     table.save(path)
     assert c.CostTable.load(path, table.fingerprint).rows == table.rows
@@ -162,7 +175,7 @@ def test_malformed_cost_row_is_rejected(dcut_modules, tmp_path):
     path = tmp_path / "table.json"
     table.save(str(path))
     data = json.loads(path.read_text())
-    data["rows"][0]["target_ms"] = -1
+    data["rows"][0]["step_ms"] = -1
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="positive"):
         c.CostTable.load(str(path), table.fingerprint)
