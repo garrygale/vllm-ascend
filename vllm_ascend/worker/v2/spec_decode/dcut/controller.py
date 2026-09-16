@@ -170,18 +170,29 @@ def has_viable_budget(
     min_gain: float,
 ) -> bool:
     """Whether any shorter cost row can possibly clear the decision threshold."""
+    return capture_gate_reason(limits, table, bucket, min_gain) is None
+
+
+def capture_gate_reason(
+    limits: np.ndarray,
+    table: CostTable,
+    bucket: int,
+    min_gain: float,
+) -> str | None:
+    """Return why probability capture cannot help, or ``None`` when viable."""
     batch = len(limits)
     full = batch + int(limits.sum())
     baseline = table.rows.get(CostKey(batch, bucket, full))
     if baseline is None:
-        return False
-    return any(
+        return "missing_baseline_row"
+    viable = any(
         key.batch_size == batch
         and key.context_bucket == bucket
         and batch <= key.query_tokens < full
         and baseline.step_ms > cost.step_ms * (1 + min_gain)
         for key, cost in table.rows.items()
     )
+    return None if viable else "no_viable_budget"
 
 
 def choose_caps(
@@ -250,29 +261,49 @@ def truncate_scheduler_output(scheduler_output: Any, req_ids: list[str], caps: n
 
 def decode_batch_info(scheduler_output: Any, req_states: Any, buckets: tuple[int, ...]) -> tuple[list[str], int] | None:
     """Require an established, unstructured batch with one target anchor each."""
+    info, _ = diagnose_batch_info(scheduler_output, req_states, buckets)
+    return info
+
+
+def diagnose_batch_info(
+    scheduler_output: Any,
+    req_states: Any,
+    buckets: tuple[int, ...],
+) -> tuple[tuple[list[str], int] | None, str | None]:
+    """Decode a safe batch and return one precise rejection reason on failure."""
     req_ids = sorted(scheduler_output.num_scheduled_tokens)
-    if (
-        not req_ids
-        or scheduler_output.scheduled_new_reqs
-        or scheduler_output.scheduled_encoder_inputs
-        or scheduler_output.has_structured_output_requests
-        or scheduler_output.preempted_req_ids
-        or scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        or sum(scheduler_output.num_scheduled_tokens.values()) != scheduler_output.total_num_scheduled_tokens
-    ):
-        return None
+    if not req_ids:
+        return None, "empty_batch"
+    if scheduler_output.scheduled_new_reqs:
+        return None, "new_requests"
+    if scheduler_output.scheduled_encoder_inputs:
+        return None, "encoder_inputs"
+    if scheduler_output.has_structured_output_requests:
+        return None, "structured_output"
+    if scheduler_output.preempted_req_ids:
+        return None, "preempted_requests"
+    if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+        return None, "resumed_requests"
+    if sum(scheduler_output.num_scheduled_tokens.values()) != scheduler_output.total_num_scheduled_tokens:
+        return None, "scheduled_token_mismatch"
     computed = dict(
         zip(scheduler_output.scheduled_cached_reqs.req_ids, scheduler_output.scheduled_cached_reqs.num_computed_tokens)
     )
     for req_id in req_ids:
         index = req_states.req_id_to_index.get(req_id)
-        if index is None or req_id not in computed or computed[req_id] < req_states.prefill_len.np[index]:
-            return None
+        if index is None:
+            return None, "unknown_request"
+        if req_id not in computed:
+            return None, "missing_computed_tokens"
+        if computed[req_id] < req_states.prefill_len.np[index]:
+            return None, "prefill_incomplete"
         if (
             scheduler_output.num_scheduled_tokens[req_id]
             - len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
             != 1
         ):
-            return None
+            return None, "non_anchor_schedule"
     bucket = context_bucket(max(computed[req_id] for req_id in req_ids), buckets)
-    return (req_ids, bucket) if bucket is not None else None
+    if bucket is None:
+        return None, "context_out_of_range"
+    return (req_ids, bucket), None

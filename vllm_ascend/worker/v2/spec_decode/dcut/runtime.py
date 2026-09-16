@@ -5,6 +5,7 @@
 import json
 import logging
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +16,9 @@ from .controller import (
     CostKey,
     CostTable,
     allocate_prefixes,
+    capture_gate_reason,
     choose_caps,
-    decode_batch_info,
-    has_viable_budget,
+    diagnose_batch_info,
     query_budgets,
 )
 
@@ -95,12 +96,16 @@ class DcutRuntime:
         self.current_started_at: float | None = None
         self.capture_requested = False
         self.collecting = False
-        self.stats = {
+        self.stats: dict[str, Any] = {
             "decisions": 0,
             "trimmed_tokens": 0,
             "fallbacks": 0,
             "capture_skips": 0,
+            "full_k_selected": 0,
             "profiled_rows": 0,
+            "fallback_reasons": {},
+            "fallback_shapes": {},
+            "fallback_shape_overflow": 0,
         }
         error = None
         if self.is_root:
@@ -114,7 +119,9 @@ class DcutRuntime:
                     except (ValueError, KeyError, TypeError) as exc:
                         if not config.generate_cost_table:
                             raise
-                        logger.warning("D-Cut cost table is stale; rebuilding it for the current configuration: %s", exc)
+                        logger.warning(
+                            "D-Cut cost table is stale; rebuilding it for the current configuration: %s", exc
+                        )
                         self.table = CostTable(fingerprint)
                         self.table.save(str(path))
                 elif config.generate_cost_table:
@@ -175,25 +182,42 @@ class DcutRuntime:
             self.measurement_started_at = None
             self.target_start = self.draft_start = self.draft_end = None
 
-    def finish_calibration(self) -> dict[str, int]:
+    def finish_calibration(self) -> dict[str, Any]:
         """Flush the final live sample via LLM.collective_rpc after generation."""
         if self.is_root and self.config.generate_cost_table:
             self._consume_measurement()
-        return self.stats.copy()
+        return deepcopy(self.stats)
 
-    def _take_probabilities(self, req_ids: list[str]) -> np.ndarray | None:
+    def _take_probabilities(self, req_ids: list[str]) -> tuple[np.ndarray | None, str | None]:
         snapshot = self.snapshot_req_ids
         self.snapshot_req_ids = None
-        if snapshot is None or len(snapshot) != len(req_ids) or set(snapshot) != set(req_ids):
-            return None
+        if snapshot is None:
+            return None, "missing_probability_snapshot"
+        if len(snapshot) != len(req_ids) or set(snapshot) != set(req_ids):
+            return None, "request_id_mismatch"
         if not self.copy_event.query():
             if self.config.generate_cost_table or self.config.wait_for_probs:
                 self.copy_event.synchronize()
             else:
-                return None
+                return None, "probabilities_not_ready"
         assert self.host_probs is not None
         rows = {req_id: row for row, req_id in enumerate(snapshot)}
-        return self.host_probs.numpy()[[rows[req_id] for req_id in req_ids]].copy()
+        probabilities = self.host_probs.numpy()[[rows[req_id] for req_id in req_ids]].copy()
+        return probabilities, None
+
+    def _record_fallback(self, reason: str, shape: tuple[int, int, int, int, int] | None) -> None:
+        self.stats["fallbacks"] += 1
+        reasons = self.stats["fallback_reasons"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if shape is None:
+            return
+        batch, bucket, query, min_k, max_k = shape
+        key = f"{reason}|batch={batch},context={bucket},query={query},min_k={min_k},max_k={max_k}"
+        shapes = self.stats["fallback_shapes"]
+        if key in shapes or len(shapes) < 64:
+            shapes[key] = shapes.get(key, 0) + 1
+        else:
+            self.stats["fallback_shape_overflow"] += 1
 
     def select_caps(self, scheduler_output: Any, req_states: Any) -> tuple[list[str], np.ndarray | None]:
         """Rank zero decides, including readiness/fallback, before graph dispatch."""
@@ -204,10 +228,10 @@ class DcutRuntime:
         if self.is_root:
             self._consume_measurement()
             step_started_at = time.perf_counter()
-            info = decode_batch_info(scheduler_output, req_states, self.config.context_buckets)
+            info, batch_reason = diagnose_batch_info(scheduler_output, req_states, self.config.context_buckets)
             if info is None:
                 self.snapshot_req_ids = None
-                decision = ([], None, None, False, False)
+                decision = ([], None, None, False, batch_reason, None)
             else:
                 req_ids, bucket = info
                 limits = np.array(
@@ -216,40 +240,62 @@ class DcutRuntime:
                 )
                 caps = None
                 eligible = bool(np.all(limits <= self.block_size))
+                full_query = len(req_ids) + int(limits.sum())
+                shape = (len(req_ids), bucket, full_query, int(limits.min()), int(limits.max()))
+                fallback_reason = None
                 assert self.table is not None
-                capture = eligible and (
-                    self.config.generate_cost_table
-                    or has_viable_budget(limits, self.table, bucket, self.config.min_gain)
-                )
-                if capture:
-                    probabilities = self._take_probabilities(req_ids)
-                else:
-                    # A previous shape may have requested a copy. The current
-                    # cost bound proves it cannot help, so discard it without waiting.
+                if not eligible:
+                    capture = False
+                    fallback_reason = "ineligible_limits"
                     self.snapshot_req_ids = None
-                    probabilities = None
-                if eligible:
-                    if self.config.generate_cost_table:
-                        for budget in query_budgets(
-                            limits,
-                            self.config.candidate_ratios,
-                            self.config.candidate_draft_lengths,
-                        ):
-                            if CostKey(len(req_ids), bucket, budget) not in self.table.rows:
-                                # Balanced prefixes measure shapes without depending on confidence.
-                                gains = np.broadcast_to(
-                                    -np.arange(self.block_size, dtype=np.float64), (len(req_ids), self.block_size)
-                                )
-                                caps = allocate_prefixes(gains, limits, budget - len(req_ids))
-                                break
-                    if caps is None and probabilities is not None:
-                        caps = choose_caps(probabilities, limits, self.table, bucket, self.config.min_gain)
-                decision = (req_ids, caps.tolist() if caps is not None else None, bucket, capture, eligible)
-        req_ids, caps_list, bucket, capture, eligible = self.tp_group.broadcast_object(decision, src=0)
+                elif self.config.generate_cost_table:
+                    capture = True
+                    # Consume the preceding copy so its wait remains part of the
+                    # calibrated end-to-end step, even though calibration caps do
+                    # not depend on confidence.
+                    self._take_probabilities(req_ids)
+                    for budget in query_budgets(
+                        limits,
+                        self.config.candidate_ratios,
+                        self.config.candidate_draft_lengths,
+                    ):
+                        if CostKey(len(req_ids), bucket, budget) not in self.table.rows:
+                            # Balanced prefixes measure shapes without depending on confidence.
+                            gains = np.broadcast_to(
+                                -np.arange(self.block_size, dtype=np.float64), (len(req_ids), self.block_size)
+                            )
+                            caps = allocate_prefixes(gains, limits, budget - len(req_ids))
+                            break
+                    if caps is None:
+                        fallback_reason = "calibration_complete"
+                else:
+                    fallback_reason = capture_gate_reason(limits, self.table, bucket, self.config.min_gain)
+                    capture = fallback_reason is None
+                    if capture:
+                        probabilities, probability_reason = self._take_probabilities(req_ids)
+                        if probabilities is None:
+                            fallback_reason = probability_reason
+                        else:
+                            caps = choose_caps(probabilities, limits, self.table, bucket, self.config.min_gain)
+                            if caps is None:
+                                fallback_reason = "invalid_probabilities"
+                    else:
+                        # A previous shape may have requested a copy. The current
+                        # cost bound proves it cannot help, so discard it without waiting.
+                        self.snapshot_req_ids = None
+                decision = (
+                    req_ids,
+                    caps.tolist() if caps is not None else None,
+                    bucket,
+                    capture,
+                    fallback_reason,
+                    shape,
+                )
+        req_ids, caps_list, bucket, capture, fallback_reason, shape = self.tp_group.broadcast_object(decision, src=0)
         self.capture_requested = bool(capture)
         caps = np.array(caps_list, dtype=np.int32) if caps_list is not None else None
         if caps is None:
-            self.stats["fallbacks"] += 1
+            self._record_fallback(fallback_reason or "unknown", shape)
         else:
             removed = sum(
                 len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])) - int(cap)
@@ -258,7 +304,9 @@ class DcutRuntime:
             if removed:
                 self.stats["decisions"] += 1
                 self.stats["trimmed_tokens"] += removed
-        if eligible and not self.config.generate_cost_table and not capture:
+            else:
+                self.stats["full_k_selected"] += 1
+        if fallback_reason in {"missing_baseline_row", "no_viable_budget"}:
             self.stats["capture_skips"] += 1
         if self.is_root and self.config.generate_cost_table and bucket is not None:
             total = len(req_ids) + (

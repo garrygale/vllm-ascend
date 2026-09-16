@@ -136,6 +136,7 @@ def test_unready_probability_does_not_wait_in_inference(dcut_modules, tmp_path):
     runtime.copy_event.ready = False
     assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
     assert runtime.copy_event.waits == 0
+    assert runtime.stats["fallback_reasons"]["probabilities_not_ready"] == 1
     runtime.copy_event.ready = True
     assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
 
@@ -144,6 +145,7 @@ def test_changed_request_set_never_uses_stale_probability(dcut_modules, tmp_path
     runtime = runtime_for(dcut_modules, tmp_path)
     proposal(runtime, [[0.9] * 3, [0.1] * 3], req_ids=("a", "other"))
     assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
+    assert runtime.stats["fallback_reasons"]["request_id_mismatch"] == 1
 
 
 def test_cost_gate_skips_capture_for_flat_small_batch(dcut_modules, tmp_path):
@@ -154,8 +156,37 @@ def test_cost_gate_skips_capture_for_flat_small_batch(dcut_modules, tmp_path):
     assert not runtime.capture_requested
     assert not runtime.begin_proposal(False, False)
     assert runtime.stats["capture_skips"] == 1
+    assert runtime.stats["fallback_reasons"] == {"no_viable_budget": 1}
+    assert runtime.stats["fallback_shapes"] == {
+        "no_viable_budget|batch=2,context=256,query=8,min_k=3,max_k=3": 1
+    }
     assert runtime.snapshot_req_ids is None
     assert runtime.copy_event.waits == 0
+
+
+def test_missing_baseline_and_invalid_batch_have_distinct_reasons(dcut_modules, tmp_path):
+    runtime = runtime_for(dcut_modules, tmp_path)
+    del runtime.table.rows[dcut_modules.controller.CostKey(2, 256, 8)]
+    assert runtime.select_caps(ScheduledBatch(), request_states())[1] is None
+    unsafe = ScheduledBatch(scheduled_new_reqs=[object()])
+    assert runtime.select_caps(unsafe, request_states())[1] is None
+    assert runtime.stats["fallback_reasons"] == {
+        "missing_baseline_row": 1,
+        "new_requests": 1,
+    }
+    assert runtime.stats["capture_skips"] == 1
+
+
+def test_successful_full_k_decision_is_not_a_fallback(dcut_modules, tmp_path):
+    runtime = runtime_for(dcut_modules, tmp_path)
+    key = dcut_modules.controller.CostKey(2, 256, 4)
+    runtime.table.rows[key] = dcut_modules.controller.Cost(10, 9, 1, 5)
+    proposal(runtime, [[0.99] * 3, [0.99] * 3])
+    _, caps = runtime.select_caps(ScheduledBatch(), request_states())
+    assert caps.tolist() == [3, 3]
+    assert runtime.stats["full_k_selected"] == 1
+    assert runtime.stats["decisions"] == 0
+    assert runtime.stats["fallbacks"] == 1  # Initial capture has no preceding snapshot.
 
 
 def test_tp_peers_apply_root_caps_and_capture_gate(dcut_modules, tmp_path):
@@ -277,7 +308,9 @@ def test_final_calibration_sample_is_flushed_and_not_reprofiled(dcut_modules, tm
     assert runtime.measurement_key is None
     assert runtime.finish_calibration() == stats
     stats["profiled_rows"] = -1
+    stats["fallback_reasons"]["mutated"] = 1
     assert runtime.stats["profiled_rows"] == 1
+    assert "mutated" not in runtime.stats["fallback_reasons"]
 
 
 def test_inference_never_changes_cost_table(dcut_modules, tmp_path):

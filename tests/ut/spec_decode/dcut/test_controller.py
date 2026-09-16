@@ -91,9 +91,12 @@ def test_capture_gate_uses_cost_upper_bound(dcut_modules):
     limits = np.array([3, 3])
     table = make_table(c)
     assert c.has_viable_budget(limits, table, 256, min_gain=0.02)
+    assert c.capture_gate_reason(limits, table, 256, min_gain=0.02) is None
     table.rows[c.CostKey(2, 256, 4)] = c.Cost(10.9, 9.9, 1.0, 5)
     assert not c.has_viable_budget(limits, table, 256, min_gain=0.02)
+    assert c.capture_gate_reason(limits, table, 256, min_gain=0.02) == "no_viable_budget"
     assert not c.has_viable_budget(limits, table, 512, min_gain=0.02)
+    assert c.capture_gate_reason(limits, table, 512, min_gain=0.02) == "missing_baseline_row"
 
 
 def test_prefix_truncation_preserves_original_and_scheduler_accounting(dcut_modules):
@@ -122,8 +125,19 @@ def test_invalid_caps_cannot_remove_anchor(dcut_modules, caps):
         dcut_modules.controller.truncate_scheduler_output(ScheduledBatch(), ["a", "b"], np.array(caps))
 
 
-@pytest.mark.parametrize("unsafe", ["new", "prefill", "mixed", "structured", "resumed", "preempted", "unknown"])
-def test_unsafe_batch_falls_back(dcut_modules, unsafe):
+@pytest.mark.parametrize(
+    ("unsafe", "expected_reason"),
+    [
+        ("new", "new_requests"),
+        ("prefill", "prefill_incomplete"),
+        ("mixed", "non_anchor_schedule"),
+        ("structured", "structured_output"),
+        ("resumed", "resumed_requests"),
+        ("preempted", "preempted_requests"),
+        ("unknown", "unknown_request"),
+    ],
+)
+def test_unsafe_batch_falls_back(dcut_modules, unsafe, expected_reason):
     batch, states = ScheduledBatch(), request_states()
     if unsafe == "new":
         batch.scheduled_new_reqs = [object()]
@@ -141,6 +155,9 @@ def test_unsafe_batch_falls_back(dcut_modules, unsafe):
     else:
         del states.req_id_to_index["a"]
     assert dcut_modules.controller.decode_batch_info(batch, states, (256, 512)) is None
+    info, reason = dcut_modules.controller.diagnose_batch_info(batch, states, (256, 512))
+    assert info is None
+    assert reason == expected_reason
 
 
 def test_context_and_calibration_query_budgets(dcut_modules):

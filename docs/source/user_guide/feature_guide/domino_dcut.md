@@ -132,8 +132,25 @@ python benchmarks/benchmark_domino_dcut.py \
   --cost-table /data/domino_dcut_cost.json --no-generate-cost-table
 ```
 
-The helper reports wall time, output tokens per second and worker counters
-(`decisions`, `trimmed_tokens`, `fallbacks`, `capture_skips`, `profiled_rows`).
+The helper reports wall time, output tokens per second and worker counters.
+`decisions` counts steps that actually trim drafts, `full_k_selected` counts
+successful decisions that retain the full scheduled depth, and `fallbacks` counts
+steps with no usable caps. Therefore `decisions + full_k_selected + fallbacks`
+equals the number of D-Cut selection calls. `trimmed_tokens` is the aggregate
+number of omitted draft slots, `capture_skips` is the subset of fallbacks gated
+off by the cost table, and `profiled_rows` is the number of completed calibration
+rows.
+
+`fallback_reasons` partitions every fallback into one mutually exclusive cause.
+Important inference causes include `missing_baseline_row`, `no_viable_budget`,
+`missing_probability_snapshot`, `request_id_mismatch`,
+`probabilities_not_ready`, `invalid_probabilities`, and `ineligible_limits`.
+Unsafe scheduler states use more specific names such as `new_requests`,
+`prefill_incomplete`, `non_anchor_schedule`, or `preempted_requests`.
+`fallback_shapes` counts up to 64 distinct
+`reason|batch=...,context=...,query=...,min_k=...,max_k=...` combinations;
+`fallback_shape_overflow` counts additional distinct shapes after that bound.
+These diagnostics are repeated on every TP rank and must not be summed.
 It includes prefill time and excludes model initialization; it does not report
 serving TTFT or TPOT.
 Do not use calibration throughput as the steady inference result. Keep scheduler
