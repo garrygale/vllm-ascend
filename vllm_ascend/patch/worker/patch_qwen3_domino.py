@@ -29,6 +29,7 @@ from vllm.model_executor.models.qwen3_domino import (
     DominoQwen3Attention,
     DominoQwen3DecoderLayer,
     Qwen3DominoModel,
+    SharedGLUMLP,
 )
 
 try:
@@ -171,8 +172,10 @@ def _ascend_domino_mlp_forward(
 
     The draft MLP may carry either the dense ``down_proj`` (returns an
     ``(output, bias)`` tuple) or the folded softmax readout (returns a plain
-    tensor: its softmax chunk mixture is an unquantized vector op and only the
-    trailing projection is quantized).
+    tensor: its softmax chunk mixture is an unquantized vector op and only
+    the trailing projection is quantized).  A shared gate/up MLP
+    (``dflash_config.ffn_sharing``) keeps the fused GEMM but swaps
+    ``npu_swiglu`` for the module's channel-shared activation.
     """
     gate_up = torch_npu.npu_quant_matmul(
         x8,
@@ -182,7 +185,10 @@ def _ascend_domino_mlp_forward(
         bias=None,
         output_dtype=dtype,
     )
-    x = mlp.act_fn(gate_up)
+    if isinstance(mlp, SharedGLUMLP):
+        x = mlp.shared_act(gate_up)
+    else:
+        x = mlp.act_fn(gate_up)
     out = mlp.down_proj(x)
     return out[0] if isinstance(out, tuple) else out
 
