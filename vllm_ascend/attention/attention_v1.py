@@ -491,6 +491,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.hidden_size = self.num_heads * self.head_size
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
+        if self.sliding_window is not None and self.sliding_window > 2048:
+            # FIA band mode (sparse_mode=4) derives the attended band from
+            # pre_tokens/next_tokens against a fixed 2048x2048 optimized
+            # mask, so any relative offset beyond 2048 is unrepresentable and
+            # silently corrupts attention (acceptance decay / garbled text
+            # under load). Fail fast at startup instead.
+            raise ValueError(
+                f"sliding_window={self.sliding_window} exceeds the Ascend FIA "
+                "band-mask limit of 2048 (sparse_mode=4 uses a fixed "
+                "2048x2048 optimized mask). Cap the window to <=2048 (the "
+                "Domino draft can cap it via dflash_config.sliding_window) "
+                "or use full attention for this layer."
+            )
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
         self.alibi_slopes = alibi_slopes
@@ -713,6 +726,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if sliding_window is not None and not metadata.causal
                         else 0
                     )
+                    # Same non-causal override as the non-sinks branch below:
+                    # non-causal full-attention layers must run defaultMask
+                    # (sparse_mode=0), not the causal sparse_mode=3.
+                    sparse_mode = 4 if sliding_window is not None else 3
+                    if not metadata.causal and sliding_window is None:
+                        sparse_mode = 0
                     torch_npu.npu_fused_infer_attention_score_v2.out(
                         query=query,
                         key=key_cache,
@@ -725,7 +744,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         actual_seq_kvlen=seq_lens,
                         num_key_value_heads=num_kv_heads,
                         num_query_heads=num_heads,
-                        sparse_mode=4 if sliding_window is not None else 3,
+                        sparse_mode=sparse_mode,
                         pre_tokens=sliding_window if sliding_window is not None else SWA_INT_MAX,
                         next_tokens=next_tokens,
                         softmax_scale=scale,
