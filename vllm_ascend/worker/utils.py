@@ -101,7 +101,15 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id][0]
+            # v1 passes kernel_block_sizes as list[list[int]] (per group,
+            # possibly per backend variant); the v2 runner passes the flat
+            # list[int] built by prepare_kernel_block_sizes.  Accept both.
+            kernel_bs_entry = kernel_block_sizes[group.kv_cache_group_id]
+            kernel_bs = (
+                kernel_bs_entry[0]
+                if isinstance(kernel_bs_entry, (list, tuple))
+                else kernel_bs_entry
+            )
             ratio = spec.block_size // kernel_bs
             block_dim = 0
 
