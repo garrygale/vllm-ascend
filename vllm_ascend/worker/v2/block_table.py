@@ -147,7 +147,18 @@ def _compute_slot_mappings_kernel(
         # The 'block_indics' variable results in non-contiguous memory assess,
         # which triggers degradation toscalar computation.
         # Mitigate this by loading the complete data block and extracting the required data with tl.gather
-        block_numbers = tl.load(block_table_ptr + req_state_idx * block_table_stride + tl.arange(0, TOTAL_BLOCK_SIZE))
+        # Mask the row load to the group's actual row width (block_table_stride):
+        # group row widths vary (e.g. the mamba table is only 1 + num_spec
+        # blocks wide), so an unmasked 4096-wide load reads past the row and,
+        # for the last rows, past the end of the tensor.  Gathered indices
+        # always point inside the row for valid positions, so the masked-out
+        # lanes (filled with 0) are never consumed.
+        block_load_offsets = tl.arange(0, TOTAL_BLOCK_SIZE)
+        block_numbers = tl.load(
+            block_table_ptr + req_state_idx * block_table_stride + block_load_offsets,
+            mask=block_load_offsets < block_table_stride,
+            other=0,
+        )
         block_numbers = block_numbers.to(tl.float32)
         block_numbers = tl.gather(block_numbers, block_indices, 0)
 
