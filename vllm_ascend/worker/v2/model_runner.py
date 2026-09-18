@@ -136,6 +136,32 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
 
+    def _init_kv_zero_meta(self) -> None:
+        """Build the Ascend KV-block zeroing metadata.
+
+        The inherited v2 ``_init_kv_zero_meta`` builds upstream's
+        ``KVBlockZeroer``, which skips every kv cache that is not a plain
+        ``torch.Tensor``.  Ascend v2 stores attention caches as
+        ``(k_cache, v_cache)`` tuples and Mamba/GDN state pools as lists, so
+        the upstream zeroer would silently zero nothing while the scheduler
+        keeps marking freshly allocated blocks as zeroed.  Use the
+        tuple-aware ``AscendKVBlockZeroer`` instead (it also buckets segments
+        by page size so hybrid draft/target groups with different page sizes
+        are all covered).
+        """
+        from vllm.utils.torch_utils import PIN_MEMORY
+
+        from vllm_ascend.worker.utils import AscendKVBlockZeroer
+
+        self.kv_block_zeroer = AscendKVBlockZeroer(self.device, PIN_MEMORY)
+        self.kv_block_zeroer.init_meta(
+            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+            kernel_block_sizes=self.kernel_block_sizes,
+            cache_dtype=self.cache_config.cache_dtype,
+            runner_only_attn_layers=set(),
+            static_forward_context=self.compilation_config.static_forward_context,
+        )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
