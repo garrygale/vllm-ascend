@@ -86,17 +86,17 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
+        # Update-before-replay protocol (mirrors the 310p runner and the
+        # ACL_Graph.md hazard note): the captured FIA ops wait on ExternalEvents
+        # that stay triggered after the previous update, so replaying before
+        # this step's task-update completes can observe the previous
+        # iteration's seq_lens / actual_seq_lengths.  Update first, make the
+        # current stream wait for the update stream, then replay.  The
+        # synchronize() also guarantees this step's update lands after the
+        # previous replay has fully drained (shared update_stream).
+        torch.npu.current_stream().synchronize()
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
-
-        # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
-        # calculate num_tokens_across_dp.
-        # Keep this on CPU, matching ModelAclGraphManager and the vLLM
-        # DPMetadata contract. A device tensor here makes DPMetadata.make()
-        # assert on a GPU scalar, forcing a device sync immediately after an
-        # asynchronous ACL graph replay.
         num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
-
         with set_forward_context(
             self.speculator.model_state.attn_metadata,
             self.vllm_config,
@@ -123,4 +123,6 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 self.speculator.speculative_config,
                 draft_attn_metadatas=draft_attn_metadatas,
             )
+        torch.npu.current_stream().wait_stream(self.update_stream)
+        ret = super().run_fullgraph(desc)
         return ret
