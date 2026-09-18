@@ -35,12 +35,35 @@ class CpuRunner:
         self.kwargs = kwargs
         if getattr(self, "fail", False):
             raise RuntimeError("target failed")
+        if hasattr(self, "execute_output"):
+            return self.execute_output
         return scheduler_output.total_num_scheduled_tokens
+
+    def sample_tokens(self, grammar_output):
+        if getattr(self, "fail_sample", False):
+            raise RuntimeError("sampling failed")
+        return self.sample_output
+
+
+class CpuModelRunnerOutput:
+    def __init__(self, sampled_token_ids):
+        self.sampled_token_ids = sampled_token_ids
+
+
+class CpuAsyncModelRunnerOutput:
+    def __init__(self, output):
+        self.output = output
+
+    def get_output(self):
+        return self.output
 
 
 class CpuRuntime:
     def __init__(self):
         self.started = self.aborted = self.selected = 0
+        self.current_performance_step_id = None
+        self.recorded = []
+        self.discarded = []
 
     def select_caps(self, scheduler_output, req_states):
         self.selected += 1
@@ -52,17 +75,42 @@ class CpuRuntime:
     def abort_target(self):
         self.aborted += 1
 
+    def record_step_output(self, step_id, sampled_token_ids):
+        self.recorded.append((step_id, sampled_token_ids))
+
+    def discard_step_output(self, step_id):
+        self.discarded.append(step_id)
+
 
 def cpu_runner(dcut_modules):
+    tracked_output_cls = production_methods(
+        "vllm_ascend/worker/v2/spec_decode/dcut/model_runner.py",
+        "_DcutTrackedAsyncOutput",
+        {"__init__", "get_output"},
+        CpuAsyncModelRunnerOutput,
+        {
+            "AsyncModelRunnerOutput": CpuAsyncModelRunnerOutput,
+            "DcutRuntime": object,
+            "ModelRunnerOutput": CpuModelRunnerOutput,
+        },
+    )
     cls = production_methods(
         "vllm_ascend/worker/v2/spec_decode/dcut/model_runner.py",
         "DcutNPUModelRunner",
-        {"execute_model"},
+        {"execute_model", "sample_tokens"},
         CpuRunner,
-        {"SchedulerOutput": object, "truncate_scheduler_output": dcut_modules.controller.truncate_scheduler_output},
+        {
+            "_DcutTrackedAsyncOutput": tracked_output_cls,
+            "AsyncModelRunnerOutput": CpuAsyncModelRunnerOutput,
+            "GrammarOutput": object,
+            "ModelRunnerOutput": CpuModelRunnerOutput,
+            "SchedulerOutput": object,
+            "truncate_scheduler_output": dcut_modules.controller.truncate_scheduler_output,
+        },
     )
     runner = cls()
     runner.dcut_runtime = CpuRuntime()
+    runner._dcut_performance_step_id = None
     runner.req_states = object()
     return runner
 
@@ -74,6 +122,41 @@ def test_runner_trims_before_upstream_graph_dispatch(dcut_modules):
     assert scheduled.total_num_scheduled_tokens == 8
     assert runner.dispatched.num_scheduled_tokens == {"a": 3, "b": 1}
     assert runner.dcut_runtime.started == 1
+
+
+def test_nonfallback_measurement_finishes_after_v2_sample_tokens(dcut_modules):
+    runner = cpu_runner(dcut_modules)
+    runtime = runner.dcut_runtime
+    runtime.current_performance_step_id = 17
+    runner.execute_output = None
+    model_output = CpuModelRunnerOutput([[10, 11], [20]])
+    runner.sample_output = CpuAsyncModelRunnerOutput(model_output)
+
+    assert runner.execute_model(ScheduledBatch()) is None
+    assert runner._dcut_performance_step_id == 17
+    assert runtime.recorded == []
+    assert runtime.discarded == []
+
+    tracked_output = runner.sample_tokens(None)
+    assert isinstance(tracked_output, CpuAsyncModelRunnerOutput)
+    assert runtime.recorded == []
+    assert tracked_output.get_output() is model_output
+    assert runtime.recorded == [(17, [[10, 11], [20]])]
+    assert runtime.discarded == []
+    assert runner._dcut_performance_step_id is None
+
+
+def test_sample_failure_aborts_pending_measurement(dcut_modules):
+    runner = cpu_runner(dcut_modules)
+    runner.dcut_runtime.current_performance_step_id = 19
+    runner.execute_output = None
+    assert runner.execute_model(ScheduledBatch()) is None
+
+    runner.fail_sample = True
+    with pytest.raises(RuntimeError, match="sampling failed"):
+        runner.sample_tokens(None)
+    assert runner.dcut_runtime.aborted == 1
+    assert runner._dcut_performance_step_id is None
 
 
 @pytest.mark.parametrize("bypass", ["uninitialized", "dummy", "profile"])

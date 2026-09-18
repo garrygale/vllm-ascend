@@ -18,6 +18,7 @@ from .controller import (
     allocate_prefixes,
     capture_gate_reason,
     choose_caps,
+    choose_caps_with_scores,
     diagnose_batch_info,
     query_budgets,
 )
@@ -96,6 +97,25 @@ class DcutRuntime:
         self.current_started_at: float | None = None
         self.capture_requested = False
         self.collecting = False
+        self.score_diagnostics: dict[str, Any] = {}
+        self.current_performance_step_id: int | None = None
+        self._next_performance_step_id = 0
+        self._pending_performance_steps: dict[int, dict[str, Any]] = {}
+        self._performance_totals: dict[str, float | int] = {
+            "steps": 0,
+            "trimmed_steps": 0,
+            "full_k_steps": 0,
+            "output_tokens": 0,
+            "elapsed_ms": 0.0,
+            "request_step_elapsed_ms": 0.0,
+            "output_request_steps": 0,
+            "selected_cost_table_ms": 0.0,
+            "full_k_cost_table_ms": 0.0,
+            "selected_request_cost_table_ms": 0.0,
+            "full_k_request_cost_table_ms": 0.0,
+            "selected_expected_tokens": 0.0,
+            "full_k_expected_tokens": 0.0,
+        }
         self.stats: dict[str, Any] = {
             "decisions": 0,
             "trimmed_tokens": 0,
@@ -106,6 +126,7 @@ class DcutRuntime:
             "fallback_reasons": {},
             "fallback_shapes": {},
             "fallback_shape_overflow": 0,
+            "score_diagnostic_shape_overflow": 0,
         }
         error = None
         if self.is_root:
@@ -186,7 +207,153 @@ class DcutRuntime:
         """Flush the final live sample via LLM.collective_rpc after generation."""
         if self.is_root and self.config.generate_cost_table:
             self._consume_measurement()
-        return deepcopy(self.stats)
+        stats = deepcopy(self.stats)
+        if self.config.score_diagnostics:
+            stats["score_diagnostics"] = self._summarize_score_diagnostics()
+        if self.config.performance_diagnostics and self.is_root:
+            stats["nonfallback_performance"] = self._summarize_performance_diagnostics()
+        return stats
+
+    def _start_performance_measurement(
+        self,
+        req_ids: list[str],
+        caps: np.ndarray | None,
+        bucket: int | None,
+        score_payload: dict[str, Any] | None,
+        started_at: float | None,
+    ) -> None:
+        self.current_performance_step_id = None
+        if (
+            not self.config.performance_diagnostics
+            or not self.is_root
+            or self.config.generate_cost_table
+            or caps is None
+            or bucket is None
+            or started_at is None
+        ):
+            return
+        batch_size = len(req_ids)
+        selected_query = batch_size + int(caps.sum())
+        if score_payload is None:
+            return
+        baseline_query = int(score_payload["baseline_query_tokens"])
+        baseline_cost = float(score_payload["baseline_step_ms"])
+        baseline_expected = float(score_payload["baseline_expected_tokens"])
+        if selected_query == baseline_query:
+            selected_cost = baseline_cost
+            selected_expected = baseline_expected
+        else:
+            selected = next(
+                (
+                    candidate
+                    for candidate in score_payload["candidates"]
+                    if int(candidate["query_tokens"]) == selected_query
+                ),
+                None,
+            )
+            if selected is None:
+                return
+            selected_cost = float(selected["step_ms"])
+            selected_expected = float(selected["expected_tokens"])
+        step_id = self._next_performance_step_id
+        self._next_performance_step_id += 1
+        self._pending_performance_steps[step_id] = {
+            "started_at": started_at,
+            "trimmed": selected_query < baseline_query,
+            "selected_cost_table_ms": selected_cost,
+            "full_k_cost_table_ms": baseline_cost,
+            "selected_request_cost_table_ms": selected_cost * batch_size,
+            "full_k_request_cost_table_ms": baseline_cost * batch_size,
+            "selected_expected_tokens": selected_expected,
+            "full_k_expected_tokens": baseline_expected,
+        }
+        self.current_performance_step_id = step_id
+
+    def record_step_output(self, step_id: int | None, sampled_token_ids: list[list[int]]) -> None:
+        """Complete one non-fallback measurement after async output parsing."""
+        if step_id is None or not self.is_root:
+            return
+        measurement = self._pending_performance_steps.pop(step_id, None)
+        if measurement is None:
+            return
+        output_tokens = sum(len(tokens) for tokens in sampled_token_ids)
+        output_requests = sum(bool(tokens) for tokens in sampled_token_ids)
+        elapsed_ms = (time.perf_counter() - measurement["started_at"]) * 1000
+        totals = self._performance_totals
+        totals["steps"] += 1
+        totals["trimmed_steps" if measurement["trimmed"] else "full_k_steps"] += 1
+        totals["output_tokens"] += output_tokens
+        totals["elapsed_ms"] += elapsed_ms
+        totals["request_step_elapsed_ms"] += elapsed_ms * output_requests
+        totals["output_request_steps"] += output_requests
+        for name in (
+            "selected_cost_table_ms",
+            "full_k_cost_table_ms",
+            "selected_request_cost_table_ms",
+            "full_k_request_cost_table_ms",
+            "selected_expected_tokens",
+            "full_k_expected_tokens",
+        ):
+            totals[name] += measurement[name]
+
+    def discard_step_output(self, step_id: int | None) -> None:
+        if step_id is not None:
+            self._pending_performance_steps.pop(step_id, None)
+
+    def _summarize_performance_diagnostics(self) -> dict[str, Any]:
+        totals = deepcopy(self._performance_totals)
+        steps = int(totals["steps"])
+        output_tokens = int(totals["output_tokens"])
+        elapsed_ms = float(totals["elapsed_ms"])
+        request_step_elapsed_ms = float(totals["request_step_elapsed_ms"])
+        selected_cost = float(totals["selected_cost_table_ms"])
+        full_cost = float(totals["full_k_cost_table_ms"])
+        selected_request_cost = float(totals["selected_request_cost_table_ms"])
+        full_request_cost = float(totals["full_k_request_cost_table_ms"])
+        selected_expected = float(totals["selected_expected_tokens"])
+        full_expected = float(totals["full_k_expected_tokens"])
+        actual_tps = output_tokens * 1000 / elapsed_ms if elapsed_ms > 0 else 0.0
+        aggregate_time_per_token = elapsed_ms / output_tokens if output_tokens > 0 else 0.0
+        actual_tpot = request_step_elapsed_ms / output_tokens if output_tokens > 0 else 0.0
+        selected_expected_tps = selected_expected * 1000 / selected_cost if selected_cost > 0 else 0.0
+        full_expected_tps = full_expected * 1000 / full_cost if full_cost > 0 else 0.0
+        selected_expected_tpot = selected_request_cost / selected_expected if selected_expected > 0 else 0.0
+        full_expected_tpot = full_request_cost / full_expected if full_expected > 0 else 0.0
+        nonfallback_calls = self.stats["decisions"] + self.stats["full_k_selected"]
+        selection_calls = nonfallback_calls + self.stats["fallbacks"]
+        return {
+            "steps": steps,
+            "pending_steps": len(self._pending_performance_steps),
+            "trimmed_steps": int(totals["trimmed_steps"]),
+            "full_k_steps": int(totals["full_k_steps"]),
+            "coverage": nonfallback_calls / selection_calls if selection_calls else 0.0,
+            "output_tokens": output_tokens,
+            "output_request_steps": int(totals["output_request_steps"]),
+            "elapsed_ms": elapsed_ms,
+            "request_step_elapsed_ms": request_step_elapsed_ms,
+            "output_tokens_per_second": actual_tps,
+            "tpot_ms_per_token": actual_tpot,
+            "aggregate_time_ms_per_output_token": aggregate_time_per_token,
+            "cost_table": {
+                "selected_elapsed_ms": selected_cost,
+                "full_k_elapsed_ms": full_cost,
+                "cost_only_latency_reduction": 1 - selected_cost / full_cost if full_cost > 0 else 0.0,
+            },
+            "expected": {
+                "selected_tokens": selected_expected,
+                "full_k_tokens": full_expected,
+                "selected_tokens_per_second": selected_expected_tps,
+                "full_k_tokens_per_second": full_expected_tps,
+                "selected_tpot_ms_per_token": selected_expected_tpot,
+                "full_k_tpot_ms_per_token": full_expected_tpot,
+                "throughput_change_vs_full_k": (
+                    selected_expected_tps / full_expected_tps - 1 if full_expected_tps > 0 else 0.0
+                ),
+                "tpot_reduction_vs_full_k": (
+                    1 - selected_expected_tpot / full_expected_tpot if full_expected_tpot > 0 else 0.0
+                ),
+            },
+        }
 
     def _take_probabilities(self, req_ids: list[str]) -> tuple[np.ndarray | None, str | None]:
         snapshot = self.snapshot_req_ids
@@ -219,19 +386,150 @@ class DcutRuntime:
         else:
             self.stats["fallback_shape_overflow"] += 1
 
+    def _record_score_diagnostics(self, payload: dict[str, Any] | None) -> None:
+        if payload is None:
+            return
+        shape = (
+            f"batch={payload['batch_size']},context={payload['context_bucket']},"
+            f"query={payload['baseline_query_tokens']}"
+        )
+        if shape not in self.score_diagnostics and len(self.score_diagnostics) >= 64:
+            self.stats["score_diagnostic_shape_overflow"] += 1
+            return
+        entry = self.score_diagnostics.setdefault(
+            shape,
+            {
+                "samples": 0,
+                "min_gain": self.config.min_gain,
+                "batch_size": payload["batch_size"],
+                "baseline_query_tokens": payload["baseline_query_tokens"],
+                "baseline_step_ms": payload["baseline_step_ms"],
+                "baseline_expected_tokens_sum": 0.0,
+                "baseline_score_sum": 0.0,
+                "selected_query_counts": {},
+                "best_short_query_counts": {},
+                "best_short_score_gain_sum": 0.0,
+                "best_short_score_gain_min": float("inf"),
+                "best_short_score_gain_max": -float("inf"),
+                "candidates": {},
+            },
+        )
+        entry["samples"] += 1
+        entry["baseline_expected_tokens_sum"] += payload["baseline_expected_tokens"]
+        entry["baseline_score_sum"] += payload["baseline_score"]
+        selected = str(payload["selected_query_tokens"])
+        entry["selected_query_counts"][selected] = entry["selected_query_counts"].get(selected, 0) + 1
+        candidates = payload["candidates"]
+        if candidates:
+            best_short = max(candidates, key=lambda candidate: candidate["score"])
+            best_query = str(best_short["query_tokens"])
+            entry["best_short_query_counts"][best_query] = entry["best_short_query_counts"].get(best_query, 0) + 1
+            best_gain = best_short["relative_score_gain"]
+            entry["best_short_score_gain_sum"] += best_gain
+            entry["best_short_score_gain_min"] = min(entry["best_short_score_gain_min"], best_gain)
+            entry["best_short_score_gain_max"] = max(entry["best_short_score_gain_max"], best_gain)
+        baseline_expected = payload["baseline_expected_tokens"]
+        baseline_step = payload["baseline_step_ms"]
+        for candidate in candidates:
+            query = str(candidate["query_tokens"])
+            score_gain = candidate["relative_score_gain"]
+            candidate_entry = entry["candidates"].setdefault(
+                query,
+                {
+                    "samples": 0,
+                    "query_tokens": candidate["query_tokens"],
+                    "step_ms": candidate["step_ms"],
+                    "cost_saving": 1 - candidate["step_ms"] / baseline_step,
+                    "expected_tokens_sum": 0.0,
+                    "expected_token_ratio_sum": 0.0,
+                    "score_sum": 0.0,
+                    "score_gain_sum": 0.0,
+                    "score_gain_min": float("inf"),
+                    "score_gain_max": -float("inf"),
+                    "beats_full_k": 0,
+                    "clears_min_gain": 0,
+                    "selected": 0,
+                },
+            )
+            candidate_entry["samples"] += 1
+            candidate_entry["expected_tokens_sum"] += candidate["expected_tokens"]
+            candidate_entry["expected_token_ratio_sum"] += candidate["expected_tokens"] / baseline_expected
+            candidate_entry["score_sum"] += candidate["score"]
+            candidate_entry["score_gain_sum"] += score_gain
+            candidate_entry["score_gain_min"] = min(candidate_entry["score_gain_min"], score_gain)
+            candidate_entry["score_gain_max"] = max(candidate_entry["score_gain_max"], score_gain)
+            candidate_entry["beats_full_k"] += int(score_gain > 0)
+            candidate_entry["clears_min_gain"] += int(score_gain > self.config.min_gain)
+            candidate_entry["selected"] += int(payload["selected_query_tokens"] == candidate["query_tokens"])
+
+    def _summarize_score_diagnostics(self) -> dict[str, Any]:
+        result = {}
+        for shape, entry in self.score_diagnostics.items():
+            samples = entry["samples"]
+            candidates = {}
+            for query, candidate in entry["candidates"].items():
+                count = candidate["samples"]
+                expected_ratio = candidate["expected_token_ratio_sum"] / count
+                candidates[query] = {
+                    "samples": count,
+                    "query_tokens": candidate["query_tokens"],
+                    "avg_draft_tokens_per_request": (
+                        candidate["query_tokens"] - entry["batch_size"]
+                    )
+                    / entry["batch_size"],
+                    "step_ms": candidate["step_ms"],
+                    "cost_saving": candidate["cost_saving"],
+                    "avg_expected_tokens": candidate["expected_tokens_sum"] / count,
+                    "avg_expected_token_ratio": expected_ratio,
+                    "avg_expected_token_loss": 1 - expected_ratio,
+                    # Positive means probability-weighted token loss is larger
+                    # than latency savings, so this short K cannot beat full K.
+                    "avg_loss_minus_cost_saving": (1 - expected_ratio) - candidate["cost_saving"],
+                    "avg_score": candidate["score_sum"] / count,
+                    "avg_score_gain": candidate["score_gain_sum"] / count,
+                    "min_score_gain": candidate["score_gain_min"],
+                    "max_score_gain": candidate["score_gain_max"],
+                    "beats_full_k": candidate["beats_full_k"],
+                    "clears_min_gain": candidate["clears_min_gain"],
+                    "selected": candidate["selected"],
+                }
+            result[shape] = {
+                "samples": samples,
+                "min_gain": entry["min_gain"],
+                "baseline": {
+                    "query_tokens": entry["baseline_query_tokens"],
+                    "avg_draft_tokens_per_request": (
+                        entry["baseline_query_tokens"] - entry["batch_size"]
+                    )
+                    / entry["batch_size"],
+                    "step_ms": entry["baseline_step_ms"],
+                    "avg_expected_tokens": entry["baseline_expected_tokens_sum"] / samples,
+                    "avg_score": entry["baseline_score_sum"] / samples,
+                },
+                "selected_query_counts": entry["selected_query_counts"],
+                "best_short_query_counts": entry["best_short_query_counts"],
+                "avg_best_short_score_gain": entry["best_short_score_gain_sum"] / samples,
+                "min_best_short_score_gain": entry["best_short_score_gain_min"],
+                "max_best_short_score_gain": entry["best_short_score_gain_max"],
+                "candidates": candidates,
+            }
+        return result
+
     def select_caps(self, scheduler_output: Any, req_states: Any) -> tuple[list[str], np.ndarray | None]:
         """Rank zero decides, including readiness/fallback, before graph dispatch."""
         self.current_key = None
         self.current_started_at = None
+        self.current_performance_step_id = None
         decision: Any = None
         step_started_at = None
+        performance_payload = None
         if self.is_root:
             self._consume_measurement()
             step_started_at = time.perf_counter()
             info, batch_reason = diagnose_batch_info(scheduler_output, req_states, self.config.context_buckets)
             if info is None:
                 self.snapshot_req_ids = None
-                decision = ([], None, None, False, batch_reason, None)
+                decision = ([], None, None, False, batch_reason, None, None)
             else:
                 req_ids, bucket = info
                 limits = np.array(
@@ -243,6 +541,7 @@ class DcutRuntime:
                 full_query = len(req_ids) + int(limits.sum())
                 shape = (len(req_ids), bucket, full_query, int(limits.min()), int(limits.max()))
                 fallback_reason = None
+                score_payload = None
                 assert self.table is not None
                 if not eligible:
                     capture = False
@@ -276,13 +575,49 @@ class DcutRuntime:
                         if probabilities is None:
                             fallback_reason = probability_reason
                         else:
-                            caps = choose_caps(probabilities, limits, self.table, bucket, self.config.min_gain)
+                            if self.config.score_diagnostics or self.config.performance_diagnostics:
+                                caps, scores = choose_caps_with_scores(
+                                    probabilities,
+                                    limits,
+                                    self.table,
+                                    bucket,
+                                    self.config.min_gain,
+                                )
+                                if scores is not None:
+                                    score_payload = {
+                                        "batch_size": len(req_ids),
+                                        "context_bucket": bucket,
+                                        "baseline_query_tokens": scores.baseline_query_tokens,
+                                        "baseline_expected_tokens": scores.baseline_expected_tokens,
+                                        "baseline_step_ms": scores.baseline_step_ms,
+                                        "baseline_score": scores.baseline_score,
+                                        "selected_query_tokens": scores.selected_query_tokens,
+                                        "candidates": [
+                                            {
+                                                "query_tokens": candidate.query_tokens,
+                                                "expected_tokens": candidate.expected_tokens,
+                                                "step_ms": candidate.step_ms,
+                                                "score": candidate.score,
+                                                "relative_score_gain": candidate.relative_score_gain,
+                                            }
+                                            for candidate in scores.candidates
+                                        ],
+                                    }
+                            else:
+                                caps = choose_caps(
+                                    probabilities,
+                                    limits,
+                                    self.table,
+                                    bucket,
+                                    self.config.min_gain,
+                                )
                             if caps is None:
                                 fallback_reason = "invalid_probabilities"
                     else:
                         # A previous shape may have requested a copy. The current
                         # cost bound proves it cannot help, so discard it without waiting.
                         self.snapshot_req_ids = None
+                performance_payload = score_payload
                 decision = (
                     req_ids,
                     caps.tolist() if caps is not None else None,
@@ -290,8 +625,13 @@ class DcutRuntime:
                     capture,
                     fallback_reason,
                     shape,
+                    score_payload if self.config.score_diagnostics else None,
                 )
-        req_ids, caps_list, bucket, capture, fallback_reason, shape = self.tp_group.broadcast_object(decision, src=0)
+        req_ids, caps_list, bucket, capture, fallback_reason, shape, broadcast_score_payload = (
+            self.tp_group.broadcast_object(decision, src=0)
+        )
+        if self.config.score_diagnostics:
+            self._record_score_diagnostics(broadcast_score_payload)
         self.capture_requested = bool(capture)
         caps = np.array(caps_list, dtype=np.int32) if caps_list is not None else None
         if caps is None:
@@ -306,6 +646,7 @@ class DcutRuntime:
                 self.stats["trimmed_tokens"] += removed
             else:
                 self.stats["full_k_selected"] += 1
+        self._start_performance_measurement(req_ids, caps, bucket, performance_payload, step_started_at)
         if fallback_reason in {"missing_baseline_row", "no_viable_budget"}:
             self.stats["capture_skips"] += 1
         if self.is_root and self.config.generate_cost_table and bucket is not None:
@@ -329,6 +670,9 @@ class DcutRuntime:
             self.target_start.record()
 
     def abort_target(self) -> None:
+        if self.current_performance_step_id is not None:
+            self._pending_performance_steps.pop(self.current_performance_step_id, None)
+            self.current_performance_step_id = None
         self.current_key = self.measurement_key = None
         self.current_started_at = self.measurement_started_at = None
         self.target_start = self.draft_start = self.draft_end = None

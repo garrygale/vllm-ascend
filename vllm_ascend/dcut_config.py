@@ -19,6 +19,8 @@ class DcutConfig:
     profile_samples: int = 5
     min_gain: float = 0.02
     wait_for_probs: bool = True
+    score_diagnostics: bool = False
+    performance_diagnostics: bool = False
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "DcutConfig":
@@ -34,7 +36,13 @@ class DcutConfig:
         if unknown:
             raise ValueError(f"Unknown dcut_config fields: {sorted(unknown)}")
         values = values.copy()
-        for name in ("enabled", "generate_cost_table", "wait_for_probs"):
+        for name in (
+            "enabled",
+            "generate_cost_table",
+            "wait_for_probs",
+            "score_diagnostics",
+            "performance_diagnostics",
+        ):
             if name in values and not isinstance(values[name], bool):
                 raise ValueError(f"dcut_config.{name} must be a boolean")
         for name in ("candidate_draft_lengths", "context_buckets"):

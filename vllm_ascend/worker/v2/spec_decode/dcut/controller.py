@@ -38,6 +38,25 @@ class Cost:
         return max(0.0, self.step_ms - self.target_ms - self.draft_ms)
 
 
+@dataclass(frozen=True)
+class CandidateScore:
+    query_tokens: int
+    expected_tokens: float
+    step_ms: float
+    score: float
+    relative_score_gain: float
+
+
+@dataclass(frozen=True)
+class DecisionScores:
+    baseline_query_tokens: int
+    baseline_expected_tokens: float
+    baseline_step_ms: float
+    baseline_score: float
+    selected_query_tokens: int
+    candidates: tuple[CandidateScore, ...]
+
+
 class CostTable:
     def __init__(self, fingerprint: dict[str, Any]):
         self.fingerprint = fingerprint
@@ -202,6 +221,30 @@ def choose_caps(
     bucket: int,
     min_gain: float,
 ) -> np.ndarray | None:
+    caps, _ = _choose_caps(probabilities, limits, table, bucket, min_gain, collect_scores=False)
+    return caps
+
+
+def choose_caps_with_scores(
+    probabilities: np.ndarray,
+    limits: np.ndarray,
+    table: CostTable,
+    bucket: int,
+    min_gain: float,
+) -> tuple[np.ndarray | None, DecisionScores | None]:
+    """Choose prefixes and return the score decomposition for diagnostics."""
+    return _choose_caps(probabilities, limits, table, bucket, min_gain, collect_scores=True)
+
+
+def _choose_caps(
+    probabilities: np.ndarray,
+    limits: np.ndarray,
+    table: CostTable,
+    bucket: int,
+    min_gain: float,
+    *,
+    collect_scores: bool,
+) -> tuple[np.ndarray | None, DecisionScores | None]:
     batch = len(limits)
     if (
         probabilities.ndim != 2
@@ -211,25 +254,49 @@ def choose_caps(
         or not np.all(np.isfinite(probabilities))
         or np.any((probabilities < 0) | (probabilities > 1))
     ):
-        return None
+        return None, None
     full = batch + int(limits.sum())
     baseline_cost = table.rows.get(CostKey(batch, bucket, full))
     if baseline_cost is None:
-        return None
+        return None, None
     gains = np.cumprod(probabilities.astype(np.float64), axis=1)
     mask = np.arange(gains.shape[1])[None, :] < limits[:, None]
-    baseline_score = (batch + gains[mask].sum()) / baseline_cost.step_ms
+    baseline_expected = float(batch + gains[mask].sum())
+    baseline_score = baseline_expected / baseline_cost.step_ms
     best_score = baseline_score
     best_caps = limits.copy()
+    selected_query = full
+    candidate_scores = []
     for key, cost in sorted(table.rows.items()):
         if key.batch_size != batch or key.context_bucket != bucket or not batch <= key.query_tokens < full:
             continue
         caps = allocate_prefixes(gains, limits, key.query_tokens - batch)
         kept = np.arange(gains.shape[1])[None, :] < caps[:, None]
-        score = (batch + gains[kept].sum()) / cost.step_ms
+        expected = float(batch + gains[kept].sum())
+        score = expected / cost.step_ms
+        if collect_scores:
+            candidate_scores.append(
+                CandidateScore(
+                    query_tokens=key.query_tokens,
+                    expected_tokens=expected,
+                    step_ms=cost.step_ms,
+                    score=score,
+                    relative_score_gain=score / baseline_score - 1,
+                )
+            )
         if score > best_score and score > baseline_score * (1 + min_gain):
-            best_score, best_caps = score, caps
-    return best_caps
+            best_score, best_caps, selected_query = score, caps, key.query_tokens
+    diagnostics = None
+    if collect_scores:
+        diagnostics = DecisionScores(
+            baseline_query_tokens=full,
+            baseline_expected_tokens=baseline_expected,
+            baseline_step_ms=baseline_cost.step_ms,
+            baseline_score=baseline_score,
+            selected_query_tokens=selected_query,
+            candidates=tuple(candidate_scores),
+        )
+    return best_caps, diagnostics
 
 
 def truncate_scheduler_output(scheduler_output: Any, req_ids: list[str], caps: np.ndarray) -> Any:

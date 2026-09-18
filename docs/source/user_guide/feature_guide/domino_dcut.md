@@ -30,7 +30,9 @@ decision broadcasts are installed. Only `enabled=true` selects D-Cut subclasses.
     "profile_samples": 5,
     "min_gain": 0.02,
     "candidate_ratios": [0.25, 0.5, 0.75, 1.0],
-    "wait_for_probs": true
+    "wait_for_probs": true,
+    "score_diagnostics": false,
+    "performance_diagnostics": false
   }
 }
 ```
@@ -129,7 +131,9 @@ python benchmarks/benchmark_domino_dcut.py \
 
 python benchmarks/benchmark_domino_dcut.py \
   --draft-model /data/qwen3_8b_domino \
-  --cost-table /data/domino_dcut_cost.json --no-generate-cost-table
+  --cost-table /data/domino_dcut_cost.json --no-generate-cost-table \
+  --performance-diagnostics
+
 ```
 
 The helper reports wall time, output tokens per second and worker counters.
@@ -153,6 +157,50 @@ Unsafe scheduler states use more specific names such as `new_requests`,
 These diagnostics are repeated on every TP rank and must not be summed.
 It includes prefill time and excludes model initialization; it does not report
 serving TTFT or TPOT.
+
+Set `score_diagnostics=true` (or pass `--score-diagnostics` to the benchmark
+helper) to explain why a valid decision keeps the full K. The resulting
+`score_diagnostics` section groups decisions by batch, context bucket and full
+query-token count. For each shorter query budget it reports:
+
+- `avg_draft_tokens_per_request`: the query budget expressed as average K.
+  This remains meaningful when individual requests receive uneven prefix lengths.
+- `cost_saving`: fractional `step_ms` reduction relative to full K.
+- `avg_expected_token_loss`: fractional probability-weighted output-token loss.
+- `avg_loss_minus_cost_saving`: the direct cause indicator. A positive value
+  means the expected-token loss exceeds the latency saving, so short K scores
+  below full K; a negative value means it can beat full K.
+- `avg_score_gain`: fractional change in `expected_tokens / step_ms`;
+  `beats_full_k` counts samples above zero and `clears_min_gain` counts samples
+  above the configured selection threshold.
+- `selected_query_counts` and `best_short_query_counts`: how often each budget
+  was selected and which short budget was the strongest alternative.
+
+All ratios are fractions, so `0.05` means 5%. Score diagnostics aggregate on the
+CPU and enlarge the TP decision broadcast; disable them when collecting final
+performance numbers.
+
+Set `performance_diagnostics=true` (or pass `--performance-diagnostics`) to add
+`nonfallback_performance` on TP rank zero. It excludes every fallback and starts
+timing immediately before D-Cut selection. For synchronous output it stops when
+`execute_model` returns; for asynchronous output it stops after the normal D2H
+copy and rejection-sampler parse complete. `output_tokens` counts the actual
+accepted tokens in `sampled_token_ids`, rather than probability estimates.
+`output_tokens_per_second` is `sum(output_tokens) / sum(step latency)`.
+`aggregate_time_ms_per_output_token` is its reciprocal. `tpot_ms_per_token`
+is request-weighted: each step latency is counted once for every request that
+emitted tokens in that step, then divided by all emitted tokens. `coverage` is
+successful decisions divided by all D-Cut selection calls. Per-step latencies can
+overlap under async scheduling, so this is a local non-fallback diagnostic and
+must be reported together with the benchmark's end-to-end throughput.
+
+The nested `cost_table` block compares the calibrated selected-K and full-K costs
+for the same shapes. The nested `expected` block compares probability-weighted
+`expected_tokens / step_ms` and reports both `throughput_change_vs_full_k` and
+request-weighted `tpot_reduction_vs_full_k`; both are counterfactual estimates,
+not additional wall-clock measurements. Only rank zero emits this block, so TP
+results must not be summed.
+
 Do not use calibration throughput as the steady inference result. Keep scheduler
 limits and capture sizes identical between calibration and inference. Hardware,
 model/draft revision, dtype, quantization, TP, graph capture sizes and scheduler

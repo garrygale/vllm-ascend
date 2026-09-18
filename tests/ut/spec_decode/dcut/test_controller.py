@@ -40,8 +40,24 @@ def make_table(controller):
 def test_optimizer_selects_high_value_prefixes(dcut_modules):
     c = dcut_modules.controller
     table = make_table(c)
-    caps = c.choose_caps(np.array([[0.9] * 3, [0.1] * 3]), np.array([3, 3]), table, 256, 0.02)
+    probabilities = np.array([[0.9] * 3, [0.1] * 3])
+    caps = c.choose_caps(probabilities, np.array([3, 3]), table, 256, 0.02)
     assert caps.tolist() == [2, 0]
+    diagnostic_caps, scores = c.choose_caps_with_scores(
+        probabilities,
+        np.array([3, 3]),
+        table,
+        256,
+        0.02,
+    )
+    assert diagnostic_caps.tolist() == caps.tolist()
+    assert scores.baseline_query_tokens == 8
+    assert scores.selected_query_tokens == 4
+    assert len(scores.candidates) == 1
+    candidate = scores.candidates[0]
+    assert candidate.query_tokens == 4
+    assert candidate.expected_tokens < scores.baseline_expected_tokens
+    assert candidate.relative_score_gain == pytest.approx(candidate.score / scores.baseline_score - 1)
 
 
 def test_optimizer_matches_exhaustive_prefix_search(dcut_modules):

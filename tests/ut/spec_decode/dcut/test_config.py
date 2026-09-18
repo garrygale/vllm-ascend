@@ -35,6 +35,8 @@ def vllm_config():
         {"enabled": True, "cost_table_path": ""},
         {"profile_samples": 0},
         {"profile_warmup": -1},
+        {"score_diagnostics": "true"},
+        {"performance_diagnostics": "true"},
         {"min_gain": float("nan")},
         {"min_gain": -0.1},
         {"candidate_draft_lengths": [1.5]},
@@ -65,11 +67,15 @@ def test_supported_config_preserves_fixed_domino_block(dcut_modules):
             "cost_table_path": "cost.json",
             "candidate_ratios": [1, 0.5, 0.25, 0.5],
             "candidate_draft_lengths": [3, 0, 1, 1],
+            "score_diagnostics": True,
+            "performance_diagnostics": True,
         }
     )
     config.validate_model(vllm_config())
     assert config.candidate_ratios == (0.25, 0.5, 1.0)
     assert config.candidate_draft_lengths == (0, 1, 3)
+    assert config.score_diagnostics
+    assert config.performance_diagnostics
 
 
 @pytest.mark.parametrize(

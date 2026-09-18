@@ -72,13 +72,25 @@ def table_fingerprint(config):
     }
 
 
-def runtime_for(modules, tmp_path, generate=False, bus=None, rank=0, wait_for_probs=True, flat_cost=False):
+def runtime_for(
+    modules,
+    tmp_path,
+    generate=False,
+    bus=None,
+    rank=0,
+    wait_for_probs=True,
+    flat_cost=False,
+    score_diagnostics=False,
+    performance_diagnostics=False,
+):
     config = modules.config.DcutConfig.from_dict(
         {
             "enabled": True,
             "cost_table_path": str(tmp_path / "cost.json"),
             "generate_cost_table": generate,
             "wait_for_probs": wait_for_probs,
+            "score_diagnostics": score_diagnostics,
+            "performance_diagnostics": performance_diagnostics,
             "profile_warmup": 0,
             "profile_samples": 1,
         }
@@ -178,7 +190,7 @@ def test_missing_baseline_and_invalid_batch_have_distinct_reasons(dcut_modules, 
 
 
 def test_successful_full_k_decision_is_not_a_fallback(dcut_modules, tmp_path):
-    runtime = runtime_for(dcut_modules, tmp_path)
+    runtime = runtime_for(dcut_modules, tmp_path, score_diagnostics=True)
     key = dcut_modules.controller.CostKey(2, 256, 4)
     runtime.table.rows[key] = dcut_modules.controller.Cost(10, 9, 1, 5)
     proposal(runtime, [[0.99] * 3, [0.99] * 3])
@@ -187,12 +199,65 @@ def test_successful_full_k_decision_is_not_a_fallback(dcut_modules, tmp_path):
     assert runtime.stats["full_k_selected"] == 1
     assert runtime.stats["decisions"] == 0
     assert runtime.stats["fallbacks"] == 1  # Initial capture has no preceding snapshot.
+    diagnostic = runtime.finish_calibration()["score_diagnostics"]["batch=2,context=256,query=8"]
+    assert diagnostic["samples"] == 1
+    assert diagnostic["selected_query_counts"] == {"8": 1}
+    assert diagnostic["baseline"]["avg_draft_tokens_per_request"] == 3
+    short = diagnostic["candidates"]["4"]
+    assert short["avg_draft_tokens_per_request"] == 1
+    assert short["selected"] == 0
+    assert short["beats_full_k"] == 0
+    assert short["clears_min_gain"] == 0
+    assert short["avg_expected_token_loss"] > short["cost_saving"]
+    assert short["avg_loss_minus_cost_saving"] > 0
+    assert short["avg_score_gain"] < 0
+
+
+def test_nonfallback_performance_uses_actual_output_tokens(dcut_modules, tmp_path):
+    runtime = runtime_for(dcut_modules, tmp_path, performance_diagnostics=True)
+    proposal(runtime, [[0.9] * 3, [0.1] * 3])
+    _, caps = runtime.select_caps(ScheduledBatch(), request_states())
+    assert caps.tolist() == [2, 0]
+    step_id = runtime.current_performance_step_id
+    assert step_id is not None
+
+    runtime.record_step_output(step_id, [[10, 11, 12], [20]])
+    stats = runtime.finish_calibration()["nonfallback_performance"]
+
+    assert stats["steps"] == 1
+    assert stats["pending_steps"] == 0
+    assert stats["trimmed_steps"] == 1
+    assert stats["full_k_steps"] == 0
+    assert stats["coverage"] == pytest.approx(0.5)
+    assert stats["output_tokens"] == 4
+    assert stats["output_request_steps"] == 2
+    assert stats["elapsed_ms"] > 0
+    assert stats["request_step_elapsed_ms"] == pytest.approx(stats["elapsed_ms"] * 2)
+    assert stats["output_tokens_per_second"] == pytest.approx(4000 / stats["elapsed_ms"])
+    assert stats["aggregate_time_ms_per_output_token"] == pytest.approx(stats["elapsed_ms"] / 4)
+    assert stats["tpot_ms_per_token"] == pytest.approx(stats["elapsed_ms"] / 2)
+    assert stats["cost_table"]["selected_elapsed_ms"] == 3
+    assert stats["cost_table"]["full_k_elapsed_ms"] == 11
+    assert stats["cost_table"]["cost_only_latency_reduction"] == pytest.approx(1 - 3 / 11)
+    assert stats["expected"]["throughput_change_vs_full_k"] > 0
+    assert stats["expected"]["selected_tpot_ms_per_token"] > 0
+    assert stats["expected"]["full_k_tpot_ms_per_token"] > 0
+    assert stats["expected"]["tpot_reduction_vs_full_k"] > 0
+
+
+def test_fallback_is_excluded_from_nonfallback_performance(dcut_modules, tmp_path):
+    runtime = runtime_for(dcut_modules, tmp_path, performance_diagnostics=True)
+    runtime.select_caps(ScheduledBatch(), request_states())
+    assert runtime.current_performance_step_id is None
+    stats = runtime.finish_calibration()["nonfallback_performance"]
+    assert stats["steps"] == 0
+    assert stats["output_tokens"] == 0
 
 
 def test_tp_peers_apply_root_caps_and_capture_gate(dcut_modules, tmp_path):
     bus = {}
-    root = runtime_for(dcut_modules, tmp_path, bus=bus)
-    peer = runtime_for(dcut_modules, tmp_path, bus=bus, rank=1)
+    root = runtime_for(dcut_modules, tmp_path, bus=bus, score_diagnostics=True)
+    peer = runtime_for(dcut_modules, tmp_path, bus=bus, rank=1, score_diagnostics=True)
     enable_capture(root)
     peer.select_caps(ScheduledBatch(), request_states())
     assert peer.capture_requested
@@ -202,6 +267,7 @@ def test_tp_peers_apply_root_caps_and_capture_gate(dcut_modules, tmp_path):
     assert root_ids == peer_ids
     np.testing.assert_array_equal(root_caps, peer_caps)
     assert root.stats == peer.stats
+    assert root.finish_calibration() == peer.finish_calibration()
     assert peer.host_probs is None
     assert not peer.begin_proposal(False, False)
 
