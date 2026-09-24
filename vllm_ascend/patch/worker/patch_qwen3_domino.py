@@ -29,6 +29,7 @@ from vllm.model_executor.models.qwen3_domino import (
     DominoQwen3Attention,
     DominoQwen3DecoderLayer,
     Qwen3DominoModel,
+    RoutedOuterMLP,
     SharedGLUMLP,
 )
 
@@ -185,7 +186,9 @@ def _ascend_domino_mlp_forward(
         bias=None,
         output_dtype=dtype,
     )
-    if isinstance(mlp, SharedGLUMLP):
+    if isinstance(mlp, RoutedOuterMLP):
+        x = mlp.combine(gate_up)
+    elif isinstance(mlp, SharedGLUMLP):
         x = mlp.shared_act(gate_up)
     else:
         x = mlp.act_fn(gate_up)
