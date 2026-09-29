@@ -161,16 +161,25 @@ def main():
     print("===== SUMMARY =====")
     base = "bf16 N=2560"
     quant = "quant ND"
+    # only rank paths that actually compute the GEMM; dyn_quant is a
+    # cost-accounting row (activation quant), not a matmul path
+    gemm_names = {"bf16 N=2560", "bf16 N=4096", "quant ND", "quant NZ",
+                  "anti W8A16", "anti W4A16"}
     wins = {}
     for M in M_VALUES:
         r = results[M]
         if base not in r:
             continue
-        fastest = min(r, key=lambda k: r[k][1])
+        gemm_r = {k: v for k, v in r.items() if k in gemm_names}
+        fastest = min(gemm_r, key=lambda k: gemm_r[k][1])
         wins[fastest] = wins.get(fastest, 0) + 1
-        parts = [f"fastest={fastest} ({r[fastest][1]:.1f}us pipe)"]
+        parts = [f"fastest GEMM={fastest} ({r[fastest][1]:.1f}us pipe)"]
         if quant in r:
             parts.append(f"quantND/bf16 x{r[quant][1] / r[base][1]:.2f}")
+            if "dyn_quant" in r:
+                total = r["dyn_quant"][1] + r[quant][1]
+                parts.append(f"quant total(dyn+mm)/bf16 "
+                             f"x{total / r[base][1]:.2f}")
         if "quant NZ" in r and quant in r:
             gain = 1 - r["quant NZ"][1] / r[quant][1]
             parts.append(f"NZ precast {gain * 100:+.0f}%")
