@@ -516,6 +516,12 @@ def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
         dtype=torch.int64,
         device=model._fused_kv_weight.device,
     )
+    model._fused_kv_group_idx = torch.arange(
+        1,
+        model._num_attn_layers + 1,
+        dtype=torch.int64,
+        device=model._fused_kv_group_list.device,
+    )
     model._use_fused_context_kv = True
     model._fused_kv_quantized = True
     return True

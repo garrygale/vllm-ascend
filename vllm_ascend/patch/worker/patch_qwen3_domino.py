@@ -350,9 +350,13 @@ def precompute_and_store_context_kv(
                     .reshape(D * num_ctx, H)
                     .contiguous()
                 )
-            group_list = self._fused_kv_group_list
-            group_list.fill_(num_ctx)
-            group_list.cumsum_(0)
+            # int64 cumsum has no AICore kernel and falls to AI CPU (~100us
+            # per step); arange * num_ctx is one AICore mul.
+            group_list = torch.mul(
+                self._fused_kv_group_idx,
+                num_ctx,
+                out=self._fused_kv_group_list,
+            )
             if self._fused_kv_scheme == "w4a8":
                 all_kv_flat = torch_npu.npu_grouped_matmul(
                     x=[fused],
