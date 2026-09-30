@@ -63,19 +63,18 @@ def _ascend_domino_attention_forward(
     x8: torch.Tensor | None = None,
     x8s: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Domino attention forward with the optional fused quantized qkv.
+    """Domino attention forward with the fused qkv projection.
 
-    The fused path is attached by ``build_quantized_fused_qkv`` after
-    on-the-fly quantization (W4A8 single-pack or W4A4 packed q+k+v, one
-    projection call per layer).  In the all-W8A8 norm+quant fusion
+    The fused path is attached by ``build_fused_qkv`` after weight loading
+    (W4A8 single-pack, W4A4 packed q+k+v, W8A8, or a bf16 ``[K, N]`` fused
+    weight when the projections stayed bf16 — ``qat_exclude`` or an
+    unquantized draft — behind a plain matmul; one projection call per
+    layer either way).  In the all-W8A8 norm+quant fusion
     (``_use_fused_norm_quant``) the layer forward already ran
     ``npu_add_rms_norm_dynamic_quant`` and passes ``x8``/``x8s`` so the
-    projection skips its own activation quant.  The fused projection also
-    feeds
+    projection skips its own activation quant.  Every scheme feeds
     ``qkv_rmsnorm_rope``, which applies q/k RMSNorm + RoPE in one kernel
-    (probe: ~2x faster than split + two norms + rope).  The bf16 path keeps
-    the separate q/k/v linears, since a fused bf16 projection is slower on
-    NPU.
+    (probe: ~2x faster than split + two norms + rope).
     """
     if getattr(self, "_use_fused_qkv", False):
         scheme = self._fused_qkv_scheme
@@ -86,6 +85,8 @@ def _ascend_domino_attention_forward(
                 antiquant_scale=self._fused_qkv_scale,
                 antiquant_group_size=0,
             )
+        elif scheme == "bf16":
+            qkv = torch.matmul(hidden_states, self._fused_qkv_weight)
         elif scheme == "w4a4":
             x4, x4s = torch_npu.npu_dynamic_quant(
                 hidden_states, dst_type=torch.quint4x2

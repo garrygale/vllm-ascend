@@ -404,50 +404,10 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             flush=True,
         )
 
-    # Build the fused draft q/k/v projection buffers (single-pack of the
-    # concatenated q+k+v int4 matrix), one per layer, following each layer's
-    # scheme (layer 0 is W4A4 in the current config, the rest W4A8).
-    if len(qkv_pending) == num_layers and all(
-        len(pair) == 3 for pair in qkv_pending.values()
-    ):
-        fused_qkv_weights = []
-        fused_qkv_scales = []
-        fused_qkv_schemes = []
-        for i in range(num_layers):
-            w_int_q, scale_q, scheme = qkv_pending[i]["q"]
-            w_int_k, scale_k, _ = qkv_pending[i]["k"]
-            w_int_v, scale_v, _ = qkv_pending[i]["v"]
-            fused_int = torch.cat(
-                [w_int_q, w_int_k, w_int_v], dim=0
-            )
-            fused_scale = torch.cat([scale_q, scale_k, scale_v])
-            if scheme == "w4a8":
-                packed = torch_npu.npu_convert_weight_to_int4pack(
-                    fused_int.to(torch.int32).t().contiguous()
-                )
-                packed = torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
-                fused_scale = fused_scale.reshape(-1).to(torch.bfloat16)
-            elif scheme == "w8a8":
-                packed = fused_int.to(torch.int8).t().contiguous()
-                fused_scale = fused_scale.reshape(-1)
-            else:  # w4a4
-                packed = torch_npu.npu_convert_weight_to_int4pack(
-                    fused_int.to(torch.int32).contiguous()
-                ).transpose(-1, -2)
-                fused_scale = fused_scale.reshape(-1)
-            fused_qkv_weights.append(packed)
-            fused_qkv_scales.append(fused_scale)
-            fused_qkv_schemes.append(scheme)
-        model._fused_qkv_scheme = fused_qkv_schemes
-        model._fused_qkv_weight = fused_qkv_weights
-        model._fused_qkv_scale = fused_qkv_scales
-        model._use_fused_qkv = True
-        print(
-            f"[DominoQuant] fused draft qkv buffers built for "
-            f"{num_layers} layers "
-            f"(schemes={fused_qkv_schemes})",
-            flush=True,
-        )
+    # Stash the per-layer quantized q/k/v tensors; build_fused_qkv packs
+    # them after loading, side by side with the layers that stayed bf16
+    # (qat_exclude) and get a bf16 fused weight instead.
+    model._qkv_pending = qkv_pending
 
     return count
 
@@ -527,29 +487,84 @@ def build_quantized_fused_kv_buffers(model: torch.nn.Module) -> bool:
     return True
 
 
-def build_quantized_fused_qkv(model: torch.nn.Module) -> bool:
-    """Attach the fused draft q/k/v buffers to each attention layer.
+def build_fused_qkv(model: torch.nn.Module) -> bool:
+    """Attach the fused draft q/k/v projection to each attention layer.
 
-    Only the quantized path uses the fused projection (probe: fused bf16 is
-    slower on NPU, fused W4A8/W4A4 is faster).  The per-layer buffers built by
-    :func:`quantize_domino_model` are copied onto each ``self_attn`` module so
-    the patched attention forward can read them during the draft forward.
+    Every layer runs one fused projection feeding ``qkv_rmsnorm_rope``
+    (split + q/k RMSNorm + RoPE in one kernel).  Layers quantized by
+    :func:`quantize_domino_model` use their packed int4/int8 buffers;
+    layers whose q/k/v stayed bf16 — ``qat_exclude``, or a draft with no
+    quantization at all — get a bf16 ``[K, N]`` fused weight behind a
+    plain matmul.  The W8A8 fused norm+quant path still requires an
+    all-W8A8 scheme list (see ``build_quantized_fused_norm_quant``).
     """
-    if not getattr(model, "_use_fused_qkv", False):
-        return False
-    for i, attn in enumerate(
-        layer.self_attn for layer in model.layers
-    ):
-        attn._fused_qkv_scheme = model._fused_qkv_scheme[i]
-        attn._fused_qkv_weight = model._fused_qkv_weight[i]
-        attn._fused_qkv_scale = model._fused_qkv_scale[i]
+    pending = getattr(model, "_qkv_pending", None) or {}
+    schemes = []
+    built = 0
+    for i, attn in enumerate(layer.self_attn for layer in model.layers):
+        entry = pending.get(i)
+        if entry is not None and len(entry) != 3:
+            entry = None  # partially quantized layer; leave unfused
+        if entry is None:
+            if not all(
+                proj.weight.data.is_floating_point()
+                for proj in (attn.q_proj, attn.k_proj, attn.v_proj)
+            ):
+                schemes.append(None)
+                continue
+            weight = torch.cat(
+                [
+                    attn.q_proj.weight.data,
+                    attn.k_proj.weight.data,
+                    attn.v_proj.weight.data,
+                ],
+                dim=0,
+            ).t().contiguous()
+            scheme, scale = "bf16", None
+        else:
+            w_int_q, scale_q, scheme = entry["q"]
+            w_int_k, scale_k, _ = entry["k"]
+            w_int_v, scale_v, _ = entry["v"]
+            # Pack the concatenated q+k+v matrix as a single pack; two
+            # separately-packed int4 tensors cannot be concatenated.
+            fused_int = torch.cat([w_int_q, w_int_k, w_int_v], dim=0)
+            fused_scale = torch.cat([scale_q, scale_k, scale_v])
+            if scheme == "w4a8":
+                weight = torch_npu.npu_format_cast(
+                    torch_npu.npu_convert_weight_to_int4pack(
+                        fused_int.to(torch.int32).t().contiguous()
+                    ),
+                    ACL_FORMAT_ND,
+                )
+                scale = fused_scale.reshape(-1).to(torch.bfloat16)
+            elif scheme == "w8a8":
+                weight = fused_int.to(torch.int8).t().contiguous()
+                scale = fused_scale.reshape(-1)
+            else:  # w4a4
+                weight = torch_npu.npu_convert_weight_to_int4pack(
+                    fused_int.to(torch.int32).contiguous()
+                ).transpose(-1, -2)
+                scale = fused_scale.reshape(-1)
+        attn._fused_qkv_scheme = scheme
+        attn._fused_qkv_weight = weight
+        attn._fused_qkv_scale = scale
         # The fused split+q/k-rmsnorm+rope Triton kernel expects a bf16
         # cos/sin cache; keep a bf16 copy (no-op when it already is bf16).
         attn._fused_qkv_cos_sin_cache = (
             attn.rotary_emb.cos_sin_cache.to(torch.bfloat16).contiguous()
         )
         attn._use_fused_qkv = True
-    return True
+        schemes.append(scheme)
+        built += 1
+    model._fused_qkv_scheme = schemes
+    model._use_fused_qkv = built > 0
+    if built:
+        print(
+            f"[DominoQuant] fused draft qkv enabled for {built}/"
+            f"{len(schemes)} layers (schemes={schemes})",
+            flush=True,
+        )
+    return built > 0
 
 
 def _rms_norm_dynamic_quant_available() -> bool:

@@ -17,9 +17,9 @@ from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton_gather,
 )
 from vllm_ascend.quantization.domino import (
+    build_fused_qkv,
     build_quantized_fused_norm_quant,
     build_quantized_fused_kv_buffers,
-    build_quantized_fused_qkv,
     quantize_domino_model,
 )
 
@@ -75,18 +75,20 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                     f"precompute enabled ({self.model._fused_kv_scheme})",
                     flush=True,
                 )
-            if build_quantized_fused_qkv(self.model):
-                print(
-                    "[AscendDomino] fused draft qkv projections enabled "
-                    "(quantized)",
-                    flush=True,
-                )
-            if build_quantized_fused_norm_quant(self.model):
-                print(
-                    "[AscendDomino] W8A8 fused norm+quant enabled "
-                    "(residual-stream draft layers + context-KV)",
-                    flush=True,
-                )
+
+        # Fused qkv + qkv_rmsnorm_rope on every layer regardless of
+        # quantization: packed int4/int8 buffers where quantized, a bf16
+        # [K, N] fused weight where the projections stayed bf16.  Must run
+        # before the norm+quant check — it publishes the scheme list that
+        # gates the all-W8A8 fusion.
+        build_fused_qkv(self.model)
+
+        if num_quantized and build_quantized_fused_norm_quant(self.model):
+            print(
+                "[AscendDomino] W8A8 fused norm+quant enabled "
+                "(residual-stream draft layers + context-KV)",
+                flush=True,
+            )
 
         if not quant_fused:
             # bf16 path (quantization disabled) or unsupported quantized
