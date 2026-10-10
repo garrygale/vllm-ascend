@@ -277,6 +277,10 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
 
     # The Domino correction head is never quantized.
     exclude = qat_exclude | {"embed_proj", "hidden_proj"}
+    if dflash_config.get("out_proj_after_norm", False):
+        # The raw bf16 weight must survive so the lm_head fold in
+        # load_domino_model can read it.
+        exclude.add("output_proj")
     bulk_scheme = "W4A8" if qat_w_bit == 4 else "W8A8"
     print(
         f"[DominoQuant] quantizing draft: w_bit={qat_w_bit} a_bit={qat_a_bit} "

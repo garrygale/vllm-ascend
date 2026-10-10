@@ -273,6 +273,10 @@ def _ascend_domino_model_forward(
             positions, hidden_states, residual
         )
     hidden_states = hidden_states + residual
+    if self.out_proj_after_norm:
+        # output_proj lives in compute_draft_logits or is folded into the
+        # lm_head at load; the correction head wants this draft-width hidden.
+        return self.norm(hidden_states)
     if self.output_proj is not None:
         hidden_states = self.output_proj(hidden_states)
     return self.norm(hidden_states)

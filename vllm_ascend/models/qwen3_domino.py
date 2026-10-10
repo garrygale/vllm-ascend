@@ -125,7 +125,13 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         if self._domino_gi_table is not None:
             return
 
-        H = self.model.target_hidden_size
+        # embed_proj[0] columns are [z || gru]; z is draft-width under
+        # out_proj_after_norm.
+        H = (
+            self.model.config.hidden_size
+            if self.model.out_proj_after_norm
+            else self.model.target_hidden_size
+        )
         G = self.model.gru_hidden_dim
         M = self.model.emb_dim
 
