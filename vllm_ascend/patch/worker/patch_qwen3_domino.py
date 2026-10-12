@@ -206,7 +206,7 @@ def _ascend_domino_layer_forward(
     """
     if not getattr(self, "_use_fused_norm_quant", False):
         return _ORIGINAL_DOMINO_LAYER_FORWARD(
-            self, positions, hidden_states
+            self, positions, hidden_states, residual
         )
 
     ln1 = self.input_layernorm
