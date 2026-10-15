@@ -126,7 +126,9 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             return
 
         # embed_proj[0] columns are [z || gru]; z is draft-width under
-        # out_proj_after_norm.
+        # out_proj_after_norm. Under shared_emb_readout embed_proj reads only
+        # the GRU state and z rides the shared bottleneck via head_down_proj
+        # (head_up_proj was folded into the lm_head at load).
         H = (
             self.model.config.hidden_size
             if self.model.out_proj_after_norm
@@ -138,7 +140,6 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         with torch.no_grad():
             w_ih = self.model.prefix_gru.weight_ih_l0.detach()  # [3G, H]
             w_hh = self.model.prefix_gru.weight_hh_l0.detach()  # [3G, G]
-            fc1_w = self.model.embed_proj[0].weight.detach()  # [M, H+G]
             emb_w = self.model.embed_tokens.weight.detach()  # [V, H]
 
             gi_local = F.linear(emb_w, w_ih).contiguous()
@@ -150,8 +151,15 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             else:
                 gi_full = gi_local
             self._domino_gi_table = gi_full.contiguous()
-            self._domino_w_z = fc1_w[:, :H].contiguous()
-            w_s = fc1_w[:, H:].contiguous()
+            if self.model.shared_emb_readout:
+                self._domino_w_z = (
+                    self.model.head_down_proj.weight.detach().contiguous()
+                )
+                w_s = self.model.embed_proj.weight.detach()
+            else:
+                fc1_w = self.model.embed_proj[0].weight.detach()  # [M, H+G]
+                self._domino_w_z = fc1_w[:, :H].contiguous()
+                w_s = fc1_w[:, H:]
             self._domino_w_sh = torch.cat([w_s, w_hh], dim=0).contiguous()
 
         mb = (
@@ -204,8 +212,13 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
         s_proj = sh[:, : self.model.emb_dim]
         gh = sh[:, self.model.emb_dim:]
-        x = F.silu(z_part_i + s_proj)
-        bias = self.logits_processor(self.model.embed_proj[2], x)
+        u = z_part_i + s_proj
+        if self.model.shared_emb_readout:
+            # u already carries base + correction in emb space; the folded
+            # [V, emb] lm_head emits the final logits directly.
+            bias = self.logits_processor(self.lm_head, u)
+        else:
+            bias = self.logits_processor(self.model.embed_proj[2], F.silu(u))
         return bias, gh
 
     def domino_optimized_cell(

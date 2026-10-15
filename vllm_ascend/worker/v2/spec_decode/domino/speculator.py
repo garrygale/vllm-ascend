@@ -117,9 +117,17 @@ class AscendDominoSpeculator(DominoSpeculator):
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
 
-        base_logits = self.model.compute_draft_logits(sample_hidden)
-        vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        shared = bool(getattr(self.model, "shared_emb_readout", False))
+        if shared:
+            # Shared emb readout: per-step logits are the folded [V, emb]
+            # head on head_down_proj(z); base vocab logits never materialize.
+            z_part = self.model.domino_z_part(
+                sample_hidden.view(num_reqs, n_spec, -1)
+            )
+        else:
+            base_logits = self.model.compute_draft_logits(sample_hidden)
+            vocab_size = base_logits.shape[-1]
+            base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -140,8 +148,13 @@ class AscendDominoSpeculator(DominoSpeculator):
         )
         prefix_ids[:, 0] = anchor
         for i in range(prefix_len):
+            logits_i = (
+                self.model.emb_logits(z_part[:, i])
+                if shared
+                else base_logits[:, i]
+            )
             draft_i = self._sample_step(
-                base_logits[:, i],
+                logits_i,
                 idx_map[:, i],
                 sample_pos[:, i],
                 i,
@@ -151,14 +164,15 @@ class AscendDominoSpeculator(DominoSpeculator):
 
         gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
 
-        sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
-        z_part = self.model.domino_z_part(sample_hidden_3d)
+        if not shared:
+            sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
+            z_part = self.model.domino_z_part(sample_hidden_3d)
 
         for i in range(prefix_len, n_spec):
             bias, gh = self.model.domino_optimized_bias_and_gh(
                 gru_hidden, z_part[:, i]
             )
-            logits_i = base_logits[:, i] + bias
+            logits_i = bias if shared else base_logits[:, i] + bias
             draft_i = self._sample_step(
                 logits_i,
                 idx_map[:, i],

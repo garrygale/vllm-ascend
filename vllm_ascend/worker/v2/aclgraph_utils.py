@@ -215,6 +215,9 @@ class ModelWithContext(nn.Module):
     def domino_z_part(self, sample_hidden: torch.Tensor):
         return self.original_model.domino_z_part(sample_hidden)
 
+    def emb_logits(self, u: torch.Tensor):
+        return self.original_model.emb_logits(u)
+
     def domino_optimized_prefix(self, token_ids: torch.Tensor):
         return self.original_model.domino_optimized_prefix(token_ids)
 
