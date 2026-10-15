@@ -13,7 +13,7 @@ from vllm_ascend.worker.v2.sample.gumbel import apply_temperature, gumbel_sample
 from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_logprobs
 from vllm_ascend.worker.v2.sample.min_p import apply_min_p
 from vllm_ascend.worker.v2.sample.penalties import apply_penalties, bincount
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _prepare_dflash_inputs_kernel_ascend
+from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
     rejection_sample as npu_rejection_sample,
 )
@@ -39,6 +39,10 @@ logprob.compute_token_logprobs = compute_token_logprobs
 structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
 rejection_sampler_utils.rejection_sample = npu_rejection_sample
 rejection_sampler.rejection_sample = npu_rejection_sample
-dflash_speculator._prepare_dflash_inputs_kernel = _prepare_dflash_inputs_kernel_ascend
+# Upstream's prepare_dflash_inputs serializes context, query, sample and
+# graph-padding work per request and pads with single-element stores. The
+# Ascend launcher partitions every domain across a (request, worker) grid
+# instead (upstream PR #15314).
+dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_triton
 topk_topp_sampler.apply_top_k_top_p = npu_apply_top_k_top_p
 sample_rejection_sampler.apply_top_k_top_p = npu_apply_top_k_top_p
