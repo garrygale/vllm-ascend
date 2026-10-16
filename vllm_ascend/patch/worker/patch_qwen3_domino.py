@@ -9,13 +9,21 @@ The vLLM main implementation uses ``ops.rms_norm`` and
 module-based RMSNorm, a per-layer k-norm loop, and the Ascend rotary module
 with a cloned key, mirroring ``patch_qwen3_dflash.py``.
 
-With on-the-fly W4A8 quantization, the fused K/V projection is one
+With on-the-fly W4A8 quantization, the flare fused K/V projection is one
 ``npu_grouped_matmul`` call over the per-layer packed int4 weights (3D weight
 ``[D, K, 2N//8]``, per-layer scales/offsets, ``split_item=2``); the packed
 K+V weights are built as a single pack by ``quantize_domino_model``.
+
+fc (dflash-style) fusion is served through the same seam: ``combine_hidden_states``
+returns one shared draft-width feature, so the precompute normalizes it once and
+projects it with one GEMM against the stacked ``[D * 2kv, C]`` weight.  The
+quantized fc form (one shared activation, D weight groups) needs a broadcast
+grouped matmul that has not been probed yet, so quantized fc falls back to the
+per-layer path.
 """
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 
 from vllm.model_executor.models.qwen3_domino import (
@@ -292,7 +300,7 @@ def precompute_and_store_context_kv(
 
     if context_states.dim() != 2:
         raise ValueError(
-            "Domino precompute expects 2D flare-fused context states, got "
+            "Domino precompute expects 2D fused context states, got "
             f"{context_states.shape}"
         )
 
@@ -304,13 +312,43 @@ def precompute_and_store_context_kv(
         )
         return
 
+    # fc (dflash-style) fusion shares one context feature across the draft
+    # layers; flare fuses a routed feature per layer.  ``is_flare`` comes from
+    # the upstream model (absent on older upstreams -> today's flare path).
+    is_flare = getattr(self, "is_flare", True)
+
+    if not is_flare and getattr(self, "_fused_kv_quantized", False):
+        # No fused quantized form for fc yet: feeding one shared [T, C]
+        # activation to D weight groups needs a broadcast grouped matmul
+        # (split_item=0 with x=[D, T, C]) that has not been probed on NPU.
+        # The per-layer path is exact, only slower.
+        self._precompute_and_store_context_kv_per_layer(
+            context_states, context_positions, context_slot_mapping
+        )
+        return
+
     D = self._num_attn_layers
-    H = self.target_hidden_size
+    H = (
+        self.target_hidden_size
+        if is_flare
+        else self.context_hidden_size
+    )
     kv = self._kv_size
     hd = self._head_dim
     nkv = self._num_kv_heads
 
-    if getattr(self, "_fused_kv_quantized", False):
+    if not is_flare:
+        # --- fc fused KV projection (one GEMM for all layers) ---
+        # Mirror of ``patch_qwen3_dflash.py``: the shared [T, C] feature is
+        # normalized once and projected by the stacked [D * 2kv, C] weight.
+        normed_context_states = self.hidden_norm(context_states)
+        all_kv_flat = F.linear(
+            normed_context_states,
+            self._fused_kv_weight_flat,
+            self._fused_kv_bias_flat,
+        )
+        all_kv = all_kv_flat.view(num_ctx, D, 2, nkv, hd).permute(1, 0, 2, 3, 4)
+    elif getattr(self, "_fused_kv_quantized", False):
         # --- Quantized fused KV projection (one grouped W4A8 GEMM) ---
         # All layers share the same hidden_norm; the [T, D, H] context is
         # flattened to [T*D, H], normalized in one module call, then
@@ -402,8 +440,9 @@ def precompute_and_store_context_kv(
         )
         if self._fused_kv_bias is not None:
             all_kv_flat = all_kv_flat + self._fused_kv_bias.unsqueeze(1)
-    # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
-    all_kv = all_kv_flat.view(D, num_ctx, 2, nkv, hd)
+    if is_flare:
+        # [D, T, 2, nkv, hd]; dim-2 slices are contiguous K and V.
+        all_kv = all_kv_flat.view(D, num_ctx, 2, nkv, hd)
     all_k = all_kv[:, :, 0]
     all_v = all_kv[:, :, 1]
 
