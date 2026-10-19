@@ -275,8 +275,11 @@ def quantize_domino_model(model: torch.nn.Module) -> int:
             flush=True,
         )
 
-    # The Domino correction head is never quantized.
-    exclude = qat_exclude | {"embed_proj", "hidden_proj"}
+    # The Domino correction head is never quantized. The HCA compressor is
+    # excluded hard as well: its pooling must match the training-side bf16
+    # numerics one-for-one, and the HCA dense read path consumes its outputs
+    # directly (no quantized-fused equivalent).
+    exclude = qat_exclude | {"embed_proj", "hidden_proj", "hca_compressor"}
     if dflash_config.get("shared_emb_readout", False):
         # head_up_proj must stay raw bf16 for the load-time fold into the
         # lm_head; head_down_proj feeds the triton-table z part.
