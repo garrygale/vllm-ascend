@@ -157,7 +157,13 @@ def _ascend_domino_attention_forward(
         ).view(k_shape)
 
         q, k = self.rotary_emb(positions, q, k)
+    if self.hca is not None:
+        impl = getattr(self.attn, "impl", None)
+        if impl is not None:
+            impl._hca_last_lse = None
     attn_output = self.attn(q, k, v)
+    if self.hca is not None and self._hca_pool is not None:
+        attn_output = self._hca_attention(positions, q, k, v, attn_output)
     return self.o_proj(attn_output)
 
 
@@ -295,6 +301,7 @@ def precompute_and_store_context_kv(
     context_states: torch.Tensor,
     context_positions: torch.Tensor,
     context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    context_block_table: torch.Tensor | None = None,
 ) -> None:
     num_ctx = context_states.shape[0] if context_states.dim() >= 1 else -1
 
@@ -307,6 +314,12 @@ def precompute_and_store_context_kv(
     if not hasattr(self, "_num_attn_layers"):
         self._build_fused_kv_buffers()
     if not self._use_fused_context_kv:
+        if getattr(self, "layer_hca_specs", None) is not None:
+            raise NotImplementedError(
+                "HCA (heavily_compressed_attention) drafts require the "
+                "fused context-KV precompute; the per-layer fallback does "
+                "not maintain the incremental compressor state"
+            )
         self._precompute_and_store_context_kv_per_layer(
             context_states, context_positions, context_slot_mapping
         )
@@ -493,6 +506,14 @@ def precompute_and_store_context_kv(
             all_v[i],
             kv_cache,
             slot_mapping,
+        )
+
+    if getattr(self, "layer_hca_specs", None) is not None:
+        self._pool_hca_entries(
+            context_states,
+            context_positions,
+            context_slot_mapping,
+            context_block_table,
         )
 
 

@@ -268,6 +268,9 @@ class AscendDflashProposer(AscendEagleProposer):
             self._dflash_hidden_states[:num_context],
             self._context_positions_buffer[:num_context],
             _context_slots,
+            self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].get_device_tensor()[: self.runner.input_batch.num_reqs],
         )
 
     def _raise_if_multimodal(self):

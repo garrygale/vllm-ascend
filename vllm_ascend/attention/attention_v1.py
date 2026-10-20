@@ -1152,6 +1152,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             out=[output, softmax_lse],
             **extra_args,
         )
+        # HCA merge path reads this after the Attention wrapper returns.  In
+        # the graph path the buffer is only a placeholder; the model's layout
+        # check will fall back to the dense read if it is not a real LSE.
+        self._hca_last_lse = softmax_lse
 
         output = output.view(num_tokens, self.num_heads, self.head_size)
 
@@ -1281,6 +1285,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             workspace=workspace,
             out=[output, softmax_lse],
         )
+        self._hca_last_lse = softmax_lse
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
         return output, num_tokens
@@ -1476,23 +1481,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # Non-causal sliding window (e.g. the Domino SWA draft
                 # layers): a symmetric band.  ``pre_tokens`` follows the
                 # causal SWA branch's convention.
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    scale=self.scale,
-                    pre_tokens=self.sliding_window,
-                    next_tokens=self.sliding_window,
-                    sparse_mode=4,
+                attn_output, softmax_lse = (
+                    torch_npu.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=attn_metadata.attn_mask,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        scale=self.scale,
+                        pre_tokens=self.sliding_window,
+                        next_tokens=self.sliding_window,
+                        sparse_mode=4,
+                    )
                 )
+                # HCA layers merge the entry branch with this band result; the
+                # base model reads the stash and validates the LSE layout.
+                self._hca_last_lse = softmax_lse
             elif not attn_metadata.causal:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
