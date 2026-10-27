@@ -37,6 +37,7 @@ class AttentionMaskBuilder:
         self._seq_len_cached = 0
         self.device = device
         self.chunked_prefill_attn_mask = None
+        self.band_attn_mask = None
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype):
         if self.attn_mask_cache is None or max_seq_len > self._seq_len_cached:
@@ -53,6 +54,21 @@ class AttentionMaskBuilder:
                 torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
             )
         return self.chunked_prefill_attn_mask
+
+    def get_band_attn_mask(self) -> torch.Tensor:
+        """All-zero 2048x2048 int8 mask for non-causal band attention.
+
+        FIA band mode (sparse_mode=4) requires an attention mask satisfying
+        the lower-triangular band constraint; an all-zero mask masks nothing
+        and is trivially valid, so the band semantics come purely from
+        pre_tokens/next_tokens.  A causal (split-fuse) mask would wrongly
+        hide the future positions a block-bidirectional draft must attend.
+        """
+        if self.band_attn_mask is None:
+            self.band_attn_mask = (
+                torch.zeros(2048, 2048, dtype=torch.int8).to(self.device)
+            )
+        return self.band_attn_mask
 
     def get_attention_mask(self, causal: bool, model_config: ModelConfig):
         if not causal:

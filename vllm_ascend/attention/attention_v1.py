@@ -22,7 +22,12 @@ from typing import Any
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+    get_layers_from_vllm_config,
+)
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -281,6 +286,25 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self._group_has_sliding_window_layers: bool | None = None
+
+    def _has_sliding_window_layer_impls(self) -> bool:
+        """Whether any Attention impl in this metadata's group declares a
+        window (draft SWA layers share a full-attention spec, so the spec
+        itself cannot answer this)."""
+        if self._group_has_sliding_window_layers is None:
+            from vllm.model_executor.layers.attention_layer_base import (
+                AttentionLayerBase,
+            )
+
+            layers = get_layers_from_vllm_config(
+                self.vllm_config, AttentionLayerBase, self.layer_names
+            )
+            self._group_has_sliding_window_layers = any(
+                getattr(layer.impl, "sliding_window", None) is not None
+                for layer in layers.values()
+            )
+        return self._group_has_sliding_window_layers
 
     @classmethod
     def get_cudagraph_support(
@@ -357,6 +381,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
+        if (
+            not common_attn_metadata.causal
+            and self._has_sliding_window_layer_impls()
+        ):
+            # Non-causal sliding-window draft layers run FIA band mode
+            # (sparse_mode=4, pre=next=window). Band mode requires a mask and
+            # the causal split-fuse mask would hide the future positions the
+            # block-bidirectional draft must attend, so hand it the all-zero
+            # band mask instead.  The KV-cache spec carries no window for
+            # these layers (they share a full-attention allocation group), so
+            # the check keys on the Attention implementations of this group.
+            attn_mask = self.attn_mask_builder.get_band_attn_mask()
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -586,13 +622,40 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     "and the corresponding quantized weights are required."
                 )
         self._use_layer_aware_fia_graph_replay = needs_layer_aware_fia_graph_replay()
-        self._use_max_workspace_for_fia_graph = self._use_layer_aware_fia_graph_replay
+        self._use_max_workspace_for_fia_graph = (
+            self._use_layer_aware_fia_graph_replay or self._uses_mixed_fia_geometry()
+        )
+        if self.sliding_window is not None and self.sliding_window > 2048:
+            # FIA band mode resolves the band against a fixed 2048x2048
+            # optimized mask; offsets beyond 2047 are unrepresentable and
+            # silently corrupt attention (the acceptance-decay trigger-1
+            # class). Fail at startup with the cap instead.
+            raise ValueError(
+                f"sliding_window={self.sliding_window} exceeds the Ascend "
+                "FIA band-mask limit of 2048; lower the window size."
+            )
         self.sinks = sinks
         self.layerIndex = 0
         # Some mixed-attention models cannot rely on the iteration order of
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+
+    def _uses_mixed_fia_geometry(self) -> bool:
+        """Whether the speculative draft declares per-layer windows of more
+        than one distinct size.  The first-workspace cache sizes the shared
+        workspace from whichever layer captures first; with mixed windows a
+        later layer's bigger band needs the max workspace instead.
+        """
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is None:
+            return False
+        draft_hf = getattr(spec_config.draft_model_config, "hf_config", None)
+        dflash_config = getattr(draft_hf, "dflash_config", None) or {}
+        windows = dflash_config.get("sliding_window")
+        if isinstance(windows, (list, tuple)) and len(windows) > 1:
+            return len(set(windows)) > 1
+        return False
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -630,9 +693,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
-        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window or SWA_INT_MAX
-        next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+        if self.sliding_window:
+            sparse_mode = 4
+            if attn_metadata.causal:
+                pre_tokens, next_tokens = self.sliding_window, 0
+            else:
+                # Block-bidirectional draft band: symmetric window, matching
+                # the training mask (sparse_mode=4 with pre=next=W).
+                pre_tokens, next_tokens = self.sliding_window, self.sliding_window
+        else:
+            sparse_mode = 3 if attn_metadata.causal else 0
+            pre_tokens = SWA_INT_MAX
+            next_tokens = 0 if attn_metadata.causal else SWA_INT_MAX
         output_view = output[: attn_metadata.num_actual_tokens]
 
         extra_args = {}
@@ -734,6 +806,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value.contiguous()
 
         use_max_workspace = self._use_max_workspace_for_fia_graph
+        if self.sliding_window is not None and attn_metadata.causal:
+            v2_sparse_mode = 4
+            v2_pre_tokens = self.sliding_window
+            v2_next_tokens = 0
+        elif self.sliding_window is not None:
+            # Non-causal band: symmetric window (block-bidirectional draft).
+            v2_sparse_mode = 4
+            v2_pre_tokens = self.sliding_window
+            v2_next_tokens = self.sliding_window
+        elif attn_metadata.causal:
+            v2_sparse_mode = 3
+            v2_pre_tokens = SWA_INT_MAX
+            v2_next_tokens = 0
+        else:
+            # Non-causal full attention must not run causal sparse_mode=3.
+            v2_sparse_mode = 0
+            v2_pre_tokens = SWA_INT_MAX
+            v2_next_tokens = SWA_INT_MAX
         workspace = get_capture_resource(
             _FIA_V2_WORKSPACE_KEY,
             lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
@@ -749,9 +839,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
-                sparse_mode=4 if self.sliding_window is not None else 3,
-                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
-                next_tokens=0,
+                sparse_mode=v2_sparse_mode,
+                pre_tokens=v2_pre_tokens,
+                next_tokens=v2_next_tokens,
                 learnable_sink=self.sinks,
             ),
             use_max_workspace,
@@ -770,9 +860,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "actual_seq_kvlen": actual_seq_lengths_kv,
                 "num_key_value_heads": self.num_kv_heads,
                 "num_query_heads": self.num_heads,
-                "sparse_mode": 4 if self.sliding_window is not None else 3,
-                "pre_tokens": self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
-                "next_tokens": 0,
+                "sparse_mode": v2_sparse_mode,
+                "pre_tokens": v2_pre_tokens,
+                "next_tokens": v2_next_tokens,
                 "softmax_scale": self.scale,
                 "learnable_sink": self.sinks,
                 "workspace": workspace,
@@ -916,8 +1006,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
             if self.sliding_window is not None:
                 sparse_mode = 4
+                if not attn_metadata.causal:
+                    sink_pre_tokens = self.sliding_window
+                    sink_next_tokens = self.sliding_window
+                else:
+                    sink_pre_tokens = self.sliding_window
+                    sink_next_tokens = 0
+            elif not attn_metadata.causal:
+                sparse_mode = 0
+                sink_pre_tokens = SWA_INT_MAX
+                sink_next_tokens = SWA_INT_MAX
             else:
                 sparse_mode = 3
+                sink_pre_tokens = SWA_INT_MAX
+                sink_next_tokens = 0
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query,
                 key.contiguous(),
@@ -925,8 +1027,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="TND",
-                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
-                next_tokens=0,
+                pre_tokens=sink_pre_tokens,
+                next_tokens=sink_next_tokens,
                 atten_mask=attn_metadata.attn_mask,
                 sparse_mode=sparse_mode,
                 softmax_scale=self.scale,
@@ -937,7 +1039,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
-            if not attn_metadata.causal:
+            if not attn_metadata.causal and self.sliding_window is None:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -953,6 +1055,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=0,
                 )
             elif self.sliding_window is not None:
+                if not attn_metadata.causal:
+                    # Non-causal draft band: symmetric window like training.
+                    eager_pre_tokens = self.sliding_window
+                    eager_next_tokens = self.sliding_window
+                else:
+                    eager_pre_tokens = self.sliding_window
+                    eager_next_tokens = 0
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -966,8 +1075,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_key_value_heads=self.num_kv_heads,
                     num_heads=self.num_heads,
                     scale=self.scale,
-                    pre_tokens=self.sliding_window,
-                    next_tokens=0,
+                    pre_tokens=eager_pre_tokens,
+                    next_tokens=eager_next_tokens,
                     sparse_mode=4,
                 )
             else:
