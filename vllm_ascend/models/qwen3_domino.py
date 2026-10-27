@@ -16,6 +16,7 @@ from vllm.model_executor.models.qwen3_domino import Qwen3DominoForCausalLM
 from vllm_ascend.ops.triton.spec_decode.domino_gru import (
     domino_gru_cell_triton_gather,
 )
+from vllm_ascend.quantization.domino import quantize_domino_model
 
 
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
@@ -53,6 +54,21 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             "gi_table is built after weight sharing",
             flush=True,
         )
+
+        # On-the-fly per-channel quantization driven by the draft config
+        # (dflash_config.qat_*): qat_w_bit selects the W4A8/W8A8 bulk scheme
+        # and qat_w4a4_layers the per-layer W4A4; no qat_w_bit means bf16.
+        # W4A8 (npu_weight_quant_batchmatmul, int4-packed int32) works in both
+        # eager and ACL graph mode.  Quantized projections run through the
+        # per-layer module calls (incl. the context-KV precompute); the fused
+        # buffer builders of the 0.26 branch are not ported.
+        num_quantized = quantize_domino_model(self.model)
+        if num_quantized:
+            print(
+                f"[AscendDomino] On-the-fly quantization applied to "
+                f"{num_quantized} draft linears",
+                flush=True,
+            )
 
     def _validate_domino_triton_gru(self) -> None:
         """Validate the triton-table path.
