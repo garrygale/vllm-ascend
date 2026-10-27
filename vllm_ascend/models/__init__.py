@@ -60,6 +60,16 @@ def register_model():
         "LlamaForCausalLMVwnEagle3", "vllm_ascend.models.llama_eagle3_vwn:Eagle3VwnLlamaForCausalLM"
     )
     ModelRegistry.register_model("Qwen3DSparkModel", "vllm_ascend.models.qwen3_dspark:AscendQwen3DSparkForCausalLM")
+    ModelRegistry.register_model(
+        "Qwen3DominoModel",
+        "vllm_ascend.models.qwen3_domino:AscendQwen3DominoForCausalLM",
+    )
+    # Training-time alias; vllm rewrites it to Qwen3DominoModel, but keep the
+    # key pointing at the Ascend wrapper either way.
+    ModelRegistry.register_model(
+        "DominoDraftModel",
+        "vllm_ascend.models.qwen3_domino:AscendQwen3DominoForCausalLM",
+    )
     ModelRegistry.register_model("Glm5DSparkForCausalLM", "vllm_ascend.models.glm5_dspark:Glm5DSparkForCausalLM")
     ModelRegistry.register_model(
         "Qwen3OmniDSparkModel",

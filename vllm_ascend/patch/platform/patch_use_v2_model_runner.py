@@ -24,6 +24,13 @@ def _patched_use_v2_model_runner(self) -> bool:
     purely by the VLLM_USE_V2_MODEL_RUNNER environment variable;
     model-compatibility decisions are deferred to the NPU runner itself.
     """
+    # Domino requires the MRV2 speculator path; force it like the 0.26
+    # branch did so the deployment needs no extra env var.
+    if (
+        self.speculative_config is not None
+        and self.speculative_config.method == "domino"
+    ):
+        return True
     use_v2 = envs.VLLM_USE_V2_MODEL_RUNNER
     if use_v2 is not None:
         return use_v2
