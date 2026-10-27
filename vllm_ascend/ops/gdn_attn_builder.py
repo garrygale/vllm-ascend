@@ -873,6 +873,19 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 spec_sequence_indices,
             )
+            # num_accepted_tokens includes the bonus token (1 + accepted
+            # draft tokens). A truncated final round can exceed the row's
+            # actual varlen segment length even when every scheduled token
+            # is accepted; the custom recurrent/conv ops reject accepted >
+            # seqLen. Clamp active rows to their segment length before the
+            # op sees them. (torch.minimum because torch.clamp rejects a
+            # tensor max combined with a scalar min in one call.)
+            spec_segment_lens = torch.diff(spec_query_start_loc).to(
+                num_accepted_tokens.dtype
+            )
+            num_accepted_tokens = torch.minimum(
+                num_accepted_tokens.clamp(min=1), spec_segment_lens
+            )
 
         # A FULL graph retains captured speculative conv/recurrent tasks. Clear
         # their stable inputs on every no-spec replay so an idle or prefill
