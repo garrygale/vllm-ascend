@@ -98,8 +98,16 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
 
     def _graph_replay(self, desc, attn_backend, num_tokens, draft_attn_metadatas):
+        # Update-before-replay protocol (310p / ACL_Graph.md hazard): the
+        # captured FIA ops wait on ExternalEvents that stay triggered after
+        # the previous update, so replaying before this step's task-update
+        # completes can observe the previous iteration's seq_lens /
+        # actual_seq_lengths. Synchronize, update on the update stream, make
+        # the current stream wait for it, then replay. The synchronize() also
+        # guarantees this step's update lands after the previous replay has
+        # fully drained (all graph managers share one update stream).
+        torch.npu.current_stream().synchronize()
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
         num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
@@ -126,13 +134,18 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
                 self.speculator.speculative_config,
                 draft_attn_metadatas=draft_attn_metadatas,
             )
+        torch.npu.current_stream().wait_stream(self.update_stream)
+        ret = super().run_fullgraph(desc)
         return ret
 
     def _updatable_graph_replay(self, desc, draft_attn_metadatas):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
+        # Update-before-replay protocol, see _graph_replay.
+        torch.npu.current_stream().synchronize()
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
         graph.update(self.update_stream, resolved_tasks)
+        torch.npu.current_stream().wait_stream(self.update_stream)
+        ret = super().run_fullgraph(desc)
         return ret

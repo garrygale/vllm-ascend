@@ -207,8 +207,16 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 metadata.finish_replay()
 
     def _graph_relay(self, attn_backend, desc, num_tokens, attn_metadata):
+        # Update-before-replay protocol (310p / ACL_Graph.md hazard): the
+        # captured FIA ops wait on ExternalEvents that stay triggered after
+        # the previous update, so replaying before this step's task-update
+        # completes can observe the previous iteration's seq_lens /
+        # actual_seq_lengths. Synchronize, update on the update stream, make
+        # the current stream wait for it, then replay. The synchronize() also
+        # guarantees this step's update lands after the previous replay has
+        # fully drained (all graph managers share one update stream).
+        torch.npu.current_stream().synchronize()
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -241,6 +249,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 self.vllm_config,
                 self.model_runner.speculative_config,
             )
+        torch.npu.current_stream().wait_stream(self.update_stream)
+        ret = super().run_fullgraph(desc)
         logger.info_once("ACL graph replay is active for the V2 target model (logged once).")
         return ret
 
@@ -248,9 +258,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
         resolved_tasks = graph.resolve_tasks(ContextSource(attn_metadata))
+        # Update-before-replay protocol, see _graph_relay.
+        torch.npu.current_stream().synchronize()
         self.update_stream.wait_stream(torch.npu.current_stream())
-        ret = super().run_fullgraph(desc)
         graph.update(self.update_stream, resolved_tasks)
+        torch.npu.current_stream().wait_stream(self.update_stream)
+        ret = super().run_fullgraph(desc)
         return ret
 
     def capture(
@@ -360,6 +373,38 @@ class ModelWithContext(nn.Module):
 
     def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor):
         return self.original_model.compute_confidence(head_hidden, markov_embed)
+
+    # Domino draft: the GRU-corrected sampling loop runs inside the captured
+    # draft graph, so the wrapper must forward the model's helpers. Without
+    # the pure_draft_prefix_len property the captured loop would read the
+    # getattr default (0) and bake the wrong prefix structure.
+    def embed_tokens(self, token_ids: torch.Tensor):
+        return self.original_model.embed_tokens(token_ids)
+
+    def domino_gru_forward(self, embeds: torch.Tensor, h: torch.Tensor | None = None):
+        return self.original_model.domino_gru_forward(embeds, h)
+
+    def domino_gru_cell(self, x: torch.Tensor, h: torch.Tensor):
+        return self.original_model.domino_gru_cell(x, h)
+
+    def correction_bias(self, features: torch.Tensor):
+        return self.original_model.correction_bias(features)
+
+    def domino_z_part(self, sample_hidden: torch.Tensor):
+        return self.original_model.domino_z_part(sample_hidden)
+
+    def domino_optimized_prefix(self, token_ids: torch.Tensor):
+        return self.original_model.domino_optimized_prefix(token_ids)
+
+    def domino_optimized_bias_and_gh(self, h: torch.Tensor, z_part_i: torch.Tensor):
+        return self.original_model.domino_optimized_bias_and_gh(h, z_part_i)
+
+    def domino_optimized_cell(self, token_ids: torch.Tensor, h: torch.Tensor, gh: torch.Tensor):
+        return self.original_model.domino_optimized_cell(token_ids, h, gh)
+
+    @property
+    def pure_draft_prefix_len(self) -> int:
+        return self.original_model.pure_draft_prefix_len
 
 
 @contextmanager
