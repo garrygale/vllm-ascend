@@ -20,7 +20,11 @@ cannot be tested off-device:
      random logits (draft-quality-level only; greedy serving is one-hot);
   3. speed: per-step dense correction GEMM vs candidate step, top-K
      extraction over [B,6,V], and 6-step walk totals for B in {1,4,16},
-     K in {16,128,1024} — eager and (if available) ACL-graph replay.
+     K in {16,128,1024} — eager and (if available) ACL-graph replay,
+     including extract-inside-the-chain graphs (the serving form);
+  4. automatic analysis: implied streaming rates, dispatch overhead, the
+     serving-form walk accounting, extraction K-sensitivity, and a B=16
+     verdict line.
 
 Exit code 0 iff every check passes; the tail prints a copyable summary.
 """
@@ -109,6 +113,101 @@ def _setup_device():
               "(logic validation only; NPU numbers need torch_npu)")
         return torch.device("cuda"), torch.float16
     raise RuntimeError("no npu (torch_npu) or cuda device available")
+
+def analyze(rows, graphs, v):
+    """Print the serving-form reading of the timings collected above."""
+    ana = {}
+    w2_mb = v * M * 2 / 1e6
+    print("\n=== analysis ===")
+    print(f"W2 = {w2_mb:.1f} MB; the full walk streams 6x = {6 * w2_mb:.1f} MB "
+          f"of weights per iteration regardless of B")
+
+    print("\n[dense baseline] implied streaming rate "
+          "(bytes = W2 + ~5*B*V*2 activation traffic)")
+    for B in (1, 4, 16):
+        d = rows.get(("dense_step", B, None))
+        if d is None:
+            continue
+        mb = w2_mb + 5 * B * v * 2 / 1e6
+        bw = mb / d[0]  # MB/ms == GB/s
+        ana[f"dense_bw_B{B}_gbps"] = round(bw)
+        print(f"  B={B:2d}  {d[0] * 1e3:7.1f} us/step -> {bw:6.0f} GB/s")
+    d1 = rows.get(("dense_step", 1, None))
+    d16 = rows.get(("dense_step", 16, None))
+    if d1 and d16:
+        flat = d16[0] / d1[0]
+        ana["dense_B16_over_B1"] = round(flat, 2)
+        print(f"  B=16/B=1 step ratio {flat:.2f} -> "
+              + ("weight-stream bound" if flat < 1.3
+                 else "activation traffic visible at high B"))
+
+    if "dense6" in graphs and "topk6_K128" in graphs:
+        d6 = graphs["dense6"][0]
+        t6 = graphs["topk6_K128"][0]
+        ana["graph_chain_ratio_B4"] = round(d6 / t6, 2)
+        print(f"\n[graph replay B=4] dense6 {d6:.4f} vs topk6 {t6:.4f} ms "
+              f"(incl gather, no extract) -> {d6 / t6:.2f}x; per-step "
+              f"{d6 / 6 * 1e3:.1f} vs ~{t6 / 6 * 1e3:.1f} us")
+        eg = rows.get(("topk_step", 4, 128))
+        gg = rows.get(("gather", 4, 128))
+        if eg and gg:
+            eager_chain = 6 * eg[0] + gg[0]
+            pol = eager_chain - t6
+            ana["eager_dispatch_overhead_6steps_ms"] = round(max(pol, 0), 4)
+            print(f"  eager same chain {eager_chain:.4f} ms -> "
+                  f"~{max(pol, 0) * 1e3:.0f} us of that is per-op dispatch")
+    if "dense6" in graphs and "topk6_ext_K128" in graphs:
+        d6 = graphs["dense6"][0]
+        t6 = graphs["topk6_ext_K128"][0]
+        ana["graph_walk_ratio_B4_K128"] = round(d6 / t6, 2)
+        print(f"  serving form (extract INSIDE the chain): dense6 {d6:.4f} vs "
+              f"topk_ext_K128 {t6:.4f} ms -> {d6 / t6:.2f}x")
+
+    print("\n[walk accounting, eager min ms] "
+          "topk = extract + gather + 6 steps")
+    for B in (1, 4, 16):
+        d = rows.get(("dense_step", B, None))
+        if d is None:
+            continue
+        full = 6 * d[0]
+        cells = []
+        for K in (16, 128, 1024):
+            e = rows.get(("extract", B, K))
+            g = rows.get(("gather", B, K))
+            s = rows.get(("topk_step", B, K))
+            if not (e and g and s):
+                continue
+            topk = e[0] + g[0] + 6 * s[0]
+            cells.append(f"K{K} {topk:6.3f} ({full / topk:4.2f}x)")
+            ana[f"walk_ratio_B{B}_K{K}"] = round(full / topk, 2)
+        print(f"  B={B:2d} full {full:6.3f}   " + "   ".join(cells))
+
+    print("\n[extraction] K sensitivity (a radix select should be near-flat)")
+    for B in (1, 4, 16):
+        a = rows.get(("extract", B, 16))
+        c = rows.get(("extract", B, 1024))
+        if a and c:
+            print(f"  B={B:2d} K16 {a[0]:.3f} -> K1024 {c[0]:.3f} ms "
+                  f"({c[0] / a[0]:.2f}x)")
+
+    need = (rows.get(("dense_step", 16, None)), rows.get(("extract", 16, 128)),
+            rows.get(("gather", 16, 128)), rows.get(("topk_step", 16, 128)))
+    if all(need):
+        d16e, e, g, s = need
+        r = 6 * d16e[0] / (e[0] + g[0] + 6 * s[0])
+        if r >= 1.5:
+            msg = (f"B=16 walk ratio {r:.2f}x: correction_top_k=128 pays at "
+                   f"every batch size; phase-2 fusion optional")
+        elif r >= 1.3:
+            msg = (f"B=16 walk ratio {r:.2f}x: pays, but extraction is eating "
+                   f"the win at high B - run probe_domino_topk_fusion.py next")
+        else:
+            msg = (f"B=16 walk ratio {r:.2f}x: extraction-bound at high B - "
+                   f"phase-2 fusion needed there; K=128 still fine for B<=8")
+        ana["verdict"] = msg
+        print(f"\n[verdict] {msg}")
+    SUMMARY["analysis"] = ana
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -210,43 +309,62 @@ def main():
                   f"K{k}={v:7.3f}" for k, v in s["walk_topk_ms_min"].items()))
 
     # --------------------------------------------------- optional ACL graph
+    graphs = {}
     try:
         B = 4
-        u = (torch.randn(B, M) * 0.5).to(dev, dt)
-        base_full = (torch.randn(B, 7, v) * 2.0).to(dev, dt)
-        vals, ids = base_full[:, 1:].topk(128, dim=-1)
         us = [(torch.randn(B, M) * 0.5).to(dev, dt) for _ in range(6)]
+        base_full = (torch.randn(B, 7, v) * 2.0).to(dev, dt)
+        corr_rows = torch.arange(1, 7, device=dev)
+        vals128, ids128 = base_full.index_select(1, corr_rows).topk(128, dim=-1)
 
         def dense_chain():
             for j in range(6):
                 dense_step(us[j], base_full[:, 1 + j], w2)
 
         def topk_chain():
-            cw = topk_gather(w2, ids)
+            cw = topk_gather(w2, ids128)
             for j in range(6):
-                topk_step(us[j], vals[:, j], ids[:, j], cw[:, j])
+                topk_step(us[j], vals128[:, j], ids128[:, j], cw[:, j])
 
-        results = {}
-        for name, fn in (("dense6", dense_chain), ("topk6_K128", topk_chain)):
-            g = torch.cuda.CUDAGraph()
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(3):
-                    fn()
-            torch.cuda.current_stream().wait_stream(s)
-            with torch.cuda.graph(g):
-                fn()
-            results[name] = timed(lambda gr=g: gr.replay())
-        SUMMARY["acl_graph_B4"] = {
-            "dense_6step_ms_min": round(results["dense6"][0], 4),
-            "topk_6step_K128_ms_min": round(results["topk6_K128"][0], 4),
+        def topk_ext_chain(K):
+            def chain():
+                sl = base_full.index_select(1, corr_rows)
+                vals, ids = sl.topk(K, dim=-1)
+                cw = topk_gather(w2, ids)
+                for j in range(6):
+                    topk_step(us[j], vals[:, j], ids[:, j], cw[:, j])
+            return chain
+
+        chains = {
+            "dense6": dense_chain,
+            "topk6_K128": topk_chain,
+            "topk6_ext_K16": topk_ext_chain(16),
+            "topk6_ext_K128": topk_ext_chain(128),
         }
-        print(f"\nACL-graph replay (B=4, 6-step chains): dense "
-              f"{results['dense6'][0]:.4f} / topk128 "
-              f"{results['topk6_K128'][0]:.4f} ms (min)")
+        for name, fn in chains.items():
+            try:
+                g = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        fn()
+                torch.cuda.current_stream().wait_stream(s)
+                with torch.cuda.graph(g):
+                    fn()
+                graphs[name] = timed(lambda gr=g: gr.replay())
+            except Exception as e:  # noqa: BLE001
+                print(f"[skip] graph {name}: {type(e).__name__}: {e}")
+        if graphs:
+            SUMMARY["acl_graph_B4"] = {
+                k: round(v_[0], 4) for k, v_ in graphs.items()
+            }
+            print(f"\nACL-graph replay (B=4, 6-step chains, min ms): "
+                  + "  ".join(f"{k}={v_[0]:.4f}" for k, v_ in graphs.items()))
     except Exception as e:  # noqa: BLE001
         print(f"\n[skip] ACL-graph section unavailable: {type(e).__name__}: {e}")
+
+    analyze(rows, graphs, v)
 
     print("\n=== copyable summary ===")
     import json
