@@ -189,6 +189,30 @@ def analyze(rows, graphs, v):
         if a and c:
             print(f"  B={B:2d} K16 {a[0]:.3f} -> K1024 {c[0]:.3f} ms "
                   f"({c[0] / a[0]:.2f}x)")
+    print("[extraction] decomposition @K=128 "
+          "(row copy vs topk itself, sorted=False, strided view)")
+    for B in (1, 4, 16):
+        io = rows.get(("idxsel", B, None))
+        tk = rows.get(("topk_only", B, 128))
+        ex = rows.get(("extract", B, 128))
+        un = rows.get(("extract_unsorted", B, 128))
+        vw = rows.get(("extract_view", B, 128))
+        if not (io and tk and ex):
+            continue
+        share = tk[0] / ex[0] if ex[0] else 0.0
+        line = (f"  B={B:2d} idxsel {io[0]:.3f} + topk {tk[0]:.3f} "
+                f"= extract {ex[0]:.3f} ms (topk is {share:.0%} of it)")
+        if un:
+            line += f"; sorted=False {un[0]:.3f} ({ex[0] / un[0]:.2f}x)"
+            ana[f"extract_unsorted_vs_sorted_B{B}"] = round(ex[0] / un[0], 2)
+        if vw:
+            line += f"; strided view {vw[0]:.3f}"
+            ana[f"extract_view_vs_copy_B{B}"] = round(ex[0] / vw[0], 2)
+        print(line)
+        ana[f"extract_topk_share_B{B}"] = round(share, 2)
+        if share > 0.7:
+            print("       -> aclnnTopK-bound (not the copy): a faster "
+                  "selection primitive is the fix, not fusion")
 
     need = (rows.get(("dense_step", 16, None)), rows.get(("extract", 16, 128)),
             rows.get(("gather", 16, 128)), rows.get(("topk_step", 16, 128)))
@@ -264,6 +288,17 @@ def main():
             mn_e, p50_e = timed(
                 lambda: base_full.index_select(1, corr_rows).topk(K, dim=-1)
             )
+            # extract decomposition + cheap variants: is the cost the row
+            # copy, the radix topk itself, or the sorted order?
+            sl = base_full.index_select(1, corr_rows)
+            rows[("idxsel", B, None)] = timed(
+                lambda: base_full.index_select(1, corr_rows))
+            rows[("topk_only", B, K)] = timed(lambda: sl.topk(K, dim=-1))
+            rows[("extract_unsorted", B, K)] = timed(
+                lambda: base_full.index_select(1, corr_rows).topk(
+                    K, dim=-1, sorted=False))
+            rows[("extract_view", B, K)] = timed(
+                lambda: base_full[:, 1:].topk(K, dim=-1))
             vals, ids = base_full.index_select(1, corr_rows).topk(K, dim=-1)
             mn_g, p50_g = timed(lambda: topk_gather(w2, ids))
             cand_w = topk_gather(w2, ids)
