@@ -24,6 +24,28 @@ from vllm_ascend.quantization.domino import (
 )
 
 
+def _correction_top_k_from_config(model) -> int | None:
+    """Resolve ``dflash_config.correction_top_k`` (None = full-vocab walk)."""
+    dfc = getattr(model.config, "dflash_config", None) or {}
+    top_k = dfc.get("correction_top_k")
+    if top_k is None:
+        return None
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ValueError(
+            "dflash_config.correction_top_k must be a positive int, got "
+            f"{top_k!r}"
+        )
+    if model.shared_emb_readout:
+        raise ValueError(
+            "dflash_config.correction_top_k requires shared_emb_readout=false"
+        )
+    if model.embed_proj is None:
+        raise ValueError(
+            "dflash_config.correction_top_k requires use_embed_proj=true"
+        )
+    return top_k
+
+
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     """Ascend Domino wrapper.
 
@@ -36,6 +58,11 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.vllm_config = vllm_config
+        # Greedy-only candidate-limited correction (dflash_config.
+        # correction_top_k); None keeps the full-vocab walk.  Resolved in
+        # load_weights once the modules exist.
+        self.correction_top_k = None
+        self._domino_corr_w2 = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         super().load_weights(weights)
@@ -48,6 +75,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             .contiguous(),
         }
         self._domino_gi_table = None
+        self.correction_top_k = _correction_top_k_from_config(self.model)
         self._validate_domino_triton_gru()
         print(
             "[AscendDomino] Domino triton GRU is the default path; the "
@@ -162,16 +190,38 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 w_s = fc1_w[:, H:]
             self._domino_w_sh = torch.cat([w_s, w_hh], dim=0).contiguous()
 
+            if self.correction_top_k is not None and self._domino_corr_w2 is None:
+                # Full-vocab fc2 rows for the candidate-limited correction
+                # walk: gatherable rows must be rank-local, so the vocab
+                # shards are all-gathered once here (same trick as the
+                # gi_table) instead of a per-step collective.
+                fc2_w = self.model.embed_proj[2].weight.detach()
+                if not fc2_w.dtype.is_floating_point:
+                    raise ValueError(
+                        "dflash_config.correction_top_k needs an unquantized "
+                        "embed_proj.2 weight"
+                    )
+                if get_tensor_model_parallel_world_size() > 1:
+                    fc2_w = tensor_model_parallel_all_gather(fc2_w, dim=0)
+                self._domino_corr_w2 = fc2_w.contiguous()
+
         mb = (
             self._domino_gi_table.numel()
             * self._domino_gi_table.element_size()
             / 1e6
         )
-        print(
-            f"[AscendDomino] Domino triton GRU enabled "
-            f"(gi_table {mb:.0f} MB)",
-            flush=True,
-        )
+        msg = f"[AscendDomino] Domino triton GRU enabled (gi_table {mb:.0f} MB)"
+        if self._domino_corr_w2 is not None:
+            cmb = (
+                self._domino_corr_w2.numel()
+                * self._domino_corr_w2.element_size()
+                / 1e6
+            )
+            msg += (
+                f"; top-K correction K={self.correction_top_k} "
+                f"(corr table {cmb:.0f} MB)"
+            )
+        print(msg, flush=True)
 
     def domino_z_part(self, sample_hidden: torch.Tensor) -> torch.Tensor:
         """Precompute ``z @ W_z^T`` once per block: ``[B, steps, M]``."""
@@ -220,6 +270,63 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         else:
             bias = self.logits_processor(self.model.embed_proj[2], F.silu(u))
         return bias, gh
+
+    def domino_optimized_u_and_gh(
+        self,
+        h: torch.Tensor,
+        z_part_i: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Correction input + shared hidden projection, no vocab matmul.
+
+        Top-K twin of ``domino_optimized_bias_and_gh``: stops at
+        ``u = z_part_i + s_proj`` so the caller can evaluate the correction
+        on candidate rows only instead of the full-vocab fc2 GEMM.
+        """
+        self._ensure_domino_triton_gru()
+        sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
+        s_proj = sh[:, : self.model.emb_dim]
+        gh = sh[:, self.model.emb_dim:]
+        return z_part_i + s_proj, gh
+
+    def domino_topk_weights(self, base_ids: torch.Tensor) -> torch.Tensor:
+        """Gather the fc2 rows of every step's candidates at once.
+
+        ``base_ids`` is [B, steps, K]; the result [B, steps, K, M] is
+        gathered before the sequential walk starts — the ids come from the
+        base top-K and do not depend on the GRU chain, so the row traffic
+        leaves the critical path and one large index_select replaces a
+        per-step one.
+        """
+        self._ensure_domino_triton_gru()
+        b, s, k = base_ids.shape
+        return self._domino_corr_w2.index_select(
+            0, base_ids.reshape(-1)
+        ).view(b, s, k, -1)
+
+    def domino_topk_step(
+        self,
+        u: torch.Tensor,
+        base_values: torch.Tensor,
+        base_ids: torch.Tensor,
+        cand_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Greedy step over the base top-K candidates with pre-gathered rows.
+
+        ``u`` is the pre-activation correction input ([B, M]); the gathered
+        candidate rows [B, K, M] are dotted with SiLU(u), added to the base
+        values (logit_scale applied to the correction part only, matching
+        ``logits_processor(embed_proj[2], ...)``), argmaxed over K.
+        """
+        self._ensure_domino_triton_gru()
+        h = F.silu(u)
+        scores = base_values.unsqueeze(-1).to(h.dtype).clone()
+        scores.baddbmm_(
+            cand_w, h.unsqueeze(-1), beta=1.0, alpha=self.logits_processor.scale
+        )
+        best = scores.squeeze(-1).argmax(dim=-1, keepdim=True)
+        return self.map_draft_to_target(
+            base_ids.gather(1, best).squeeze(1)
+        )
 
     def domino_optimized_cell(
         self,

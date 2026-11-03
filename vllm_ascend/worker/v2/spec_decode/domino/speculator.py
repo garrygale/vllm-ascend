@@ -43,6 +43,13 @@ class AscendDominoSpeculator(DominoSpeculator):
         # done, so the one-time TP all-gather (TP>1) never runs inside ACL
         # graph capture.  ``_ensure_domino_triton_gru`` stays idempotent.
         model._ensure_domino_triton_gru()
+        top_k = getattr(model, "correction_top_k", None)
+        if top_k is not None and self.draft_logits is not None:
+            raise ValueError(
+                "dflash_config.correction_top_k supports greedy drafting only "
+                "(draft_sample_method='probabilistic' caches the draft "
+                "distribution for the p/q test)"
+            )
         return model
 
     def set_attn(
@@ -112,6 +119,9 @@ class AscendDominoSpeculator(DominoSpeculator):
         Default path (no env gate / manual fallback).  The correction head
         still produces full logits through the aclnn fc2 matmul, so sampling
         (Gumbel/top-k/top-p) is unaffected.
+
+        With ``dflash_config.correction_top_k`` the corrected rows instead
+        walk the base top-K candidates only (greedy; guarded at load).
         """
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -168,17 +178,45 @@ class AscendDominoSpeculator(DominoSpeculator):
             sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
             z_part = self.model.domino_z_part(sample_hidden_3d)
 
+        top_k = getattr(self.model, "correction_top_k", None)
+        if top_k is not None:
+            if shared:
+                raise ValueError(
+                    "correction_top_k requires shared_emb_readout=false"
+                )
+            corr_rows = torch.arange(
+                prefix_len, n_spec, device=base_logits.device
+            )
+            cand_vals, cand_ids = base_logits.index_select(
+                1, corr_rows
+            ).topk(top_k, dim=-1)
+            # Candidate fc2 rows for all steps in one gather, off the
+            # sequential GRU chain (ids are known before the walk starts).
+            cand_w = self.model.domino_topk_weights(cand_ids)
+
         for i in range(prefix_len, n_spec):
-            bias, gh = self.model.domino_optimized_bias_and_gh(
-                gru_hidden, z_part[:, i]
-            )
-            logits_i = bias if shared else base_logits[:, i] + bias
-            draft_i = self._sample_step(
-                logits_i,
-                idx_map[:, i],
-                sample_pos[:, i],
-                i,
-            )
+            if top_k is None:
+                bias, gh = self.model.domino_optimized_bias_and_gh(
+                    gru_hidden, z_part[:, i]
+                )
+                logits_i = bias if shared else base_logits[:, i] + bias
+                draft_i = self._sample_step(
+                    logits_i,
+                    idx_map[:, i],
+                    sample_pos[:, i],
+                    i,
+                )
+            else:
+                u, gh = self.model.domino_optimized_u_and_gh(
+                    gru_hidden, z_part[:, i]
+                )
+                j = i - prefix_len
+                draft_i = self.model.domino_topk_step(
+                    u,
+                    cand_vals[:, j],
+                    cand_ids[:, j],
+                    cand_w[:, j],
+                )
             self.draft_tokens[:num_reqs, i] = draft_i
             if i + 1 < n_spec:
                 gru_hidden = self.model.domino_optimized_cell(
