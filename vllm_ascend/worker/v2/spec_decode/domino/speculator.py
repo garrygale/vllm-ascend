@@ -184,8 +184,11 @@ class AscendDominoSpeculator(DominoSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_i
             prefix_ids[:, 1 + i] = draft_i
 
+        # getattr guards: keep this walk importable against a base vllm
+        # build predating the warm-up speculator attributes.
         seed_ids = prefix_ids
-        if self.correction_warmup_len > 0:
+        warmup_len = int(getattr(self, "correction_warmup_len", 0))
+        if warmup_len > 0:
             # The warm-up ring was refreshed eagerly in propose(); the table
             # GRU consumes ids, so prepend them to the prefix directly.
             seed_ids = torch.cat(
