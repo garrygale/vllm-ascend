@@ -297,6 +297,11 @@ def main():
             r = d[f"radix_extract_K{K}"][0]
             line += f"   K{K}: {a:6.3f} -> {r:6.3f} ({a / r:4.2f}x)"
         print(line)
+        r128 = d["radix_extract_K128"][0]
+        bw = 2 * (B * 6) * vv * 2 / 1e6 / r128  # MB/ms = GB/s, 2 passes
+        print(f"       radix 2-pass implied rate {bw:5.0f} GB/s "
+              f"({B * 6} programs; if far below the memory rate the "
+              f"histogram lowering is the bound, not bandwidth)")
 
     failed = [c for c in CHECKS if not c[1]]
     print("\n=== copyable summary ===")
