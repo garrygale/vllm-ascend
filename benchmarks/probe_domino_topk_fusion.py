@@ -322,6 +322,26 @@ def run(base, x, w, w2, label, gates_only=False):
     SUMMARY[f"walks_{label}"] = {k: round(v, 3) for k, v in walks.items()}
 
 
+
+def _setup_device():
+    """npu via torch_npu (+ the cuda->npu compat shim so torch.cuda.Event /
+    synchronize / CUDAGraph in this file work), or cuda for logic runs."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        torch_npu = None
+    if torch_npu is not None and torch.npu.is_available():
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        torch.npu.set_device(0)
+        print("device:", torch.npu.get_device_name(0))
+        return torch.device("npu"), torch.bfloat16
+    if torch.cuda.is_available():
+        print("device:", torch.cuda.get_device_name(0),
+              "(logic validation only; NPU numbers need torch_npu)")
+        return torch.device("cuda"), torch.float16
+    raise RuntimeError("no npu (torch_npu) or cuda device available")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="small-V logic check")
@@ -331,14 +351,7 @@ def main():
     args = ap.parse_args()
     vv = 8192 if args.quick else V
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        dev, dt = torch.device("npu"), torch.bfloat16
-        torch.npu.set_device(0)
-        print("device:", torch.npu.get_device_name(0))
-    else:
-        dev, dt = torch.device("cuda"), torch.float16
-        print("device:", torch.cuda.get_device_name(0),
-              "(logic validation only; A3 numbers need npu)")
+    dev, dt = _setup_device()
 
     torch.manual_seed(11)
     w2 = (torch.randn(vv, M_EMB, device=dev) * 0.02).to(dt)

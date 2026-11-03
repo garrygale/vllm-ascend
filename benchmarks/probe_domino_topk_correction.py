@@ -90,6 +90,26 @@ def topk_step(u, vals, ids, cand_w):
     return ids.gather(1, best).squeeze(1)
 
 
+
+def _setup_device():
+    """npu via torch_npu (+ the cuda->npu compat shim so torch.cuda.Event /
+    synchronize / CUDAGraph in this file work), or cuda for logic runs."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        torch_npu = None
+    if torch_npu is not None and torch.npu.is_available():
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        torch.npu.set_device(0)
+        print("device:", torch.npu.get_device_name(0))
+        return torch.device("npu"), torch.bfloat16
+    if torch.cuda.is_available():
+        print("device:", torch.cuda.get_device_name(0),
+              "(logic validation only; NPU numbers need torch_npu)")
+        return torch.device("cuda"), torch.float16
+    raise RuntimeError("no npu (torch_npu) or cuda device available")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--small", action="store_true",
@@ -97,11 +117,8 @@ def main():
     args = parser.parse_args()
     v = 4096 if args.small else V
 
-    dev = torch.device("npu")
-    torch.npu.set_device(0)
-    print(f"device: {torch.npu.get_device_name(0)}, "
-          f"torch {torch.__version__}, V={v}")
-    dt = torch.bfloat16
+    dev, dt = _setup_device()
+    print(f"torch {torch.__version__}, V={v}")
 
     torch.manual_seed(7)
     w2 = (torch.randn(v, M) * 0.02).to(dev, dt)
