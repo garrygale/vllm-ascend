@@ -97,42 +97,49 @@ def topk_rows_a1(flat, rows_pos, K, tile):
 
 
 # --------------------------------------------------------------------------
-# B1: fused head GEMM + in-register tile top-K (logits never materialized)
+# B1: fused head GEMM + in-register tile top-K (logits never materialized).
+# One program owns a V-tile for ALL rows, but walks the rows in chunks of
+# RC so the fp32 accumulator stays [RC, BV]: a single [M, BV] accumulator
+# (M up to 128 at B=16) blows triton-ascend's per-core unified buffer
+# ("requires 3182592 bits while 1572864 bit available").  The W tile is
+# re-read per chunk from L2, so HBM traffic is unchanged.
 # --------------------------------------------------------------------------
 @triton.jit
 def _head_topk(
     X, W, PV, PI, M, V, K, NT,
-    H: tl.constexpr, ROWS: tl.constexpr, BV: tl.constexpr, BH: tl.constexpr,
+    H: tl.constexpr, RC: tl.constexpr, BV: tl.constexpr, BH: tl.constexpr,
 ):
     pid = tl.program_id(0)
     v0 = (pid * BV).to(tl.int64)
-    rows = tl.arange(0, ROWS)
-    rmask = rows < M
-    acc = tl.zeros((ROWS, BV), dtype=tl.float32)
-    for h0 in range(0, H, BH):
-        hh = h0 + tl.arange(0, BH)
-        x = tl.load(X + rows[:, None] * H + hh[None, :],
-                    mask=rmask[:, None], other=0.0)
-        w = tl.load(W + (v0 + tl.arange(0, BV))[None, :] * H + hh[:, None])
-        acc = tl.dot(x, w, acc)
     cols = tl.arange(0, BV)
     out = pid * K
-    for k in range(K):
-        i = tl.argmax(acc, axis=1)
-        m = tl.max(acc, axis=1)
-        tl.store(PV + rows * (NT * K) + out + k, m, mask=rmask)
-        tl.store(PI + rows * (NT * K) + out + k, v0 + i, mask=rmask)
-        acc = tl.where(cols[None, :] == i[:, None], -float("inf"), acc)
+    for r0 in range(0, M, RC):
+        rows = r0 + tl.arange(0, RC)
+        rmask = rows < M
+        acc = tl.zeros((RC, BV), dtype=tl.float32)
+        for h0 in range(0, H, BH):
+            hh = h0 + tl.arange(0, BH)
+            x = tl.load(X + rows[:, None] * H + hh[None, :],
+                        mask=rmask[:, None], other=0.0)
+            w = tl.load(W + (v0 + cols)[None, :] * H + hh[:, None])
+            acc = tl.dot(x, w, acc)
+        for k in range(K):
+            i = tl.argmax(acc, axis=1)
+            m = tl.max(acc, axis=1)
+            tl.store(PV + rows * (NT * K) + out + k, m, mask=rmask)
+            tl.store(PI + rows * (NT * K) + out + k, v0 + i, mask=rmask)
+            acc = tl.where(cols[None, :] == i[:, None], -float("inf"), acc)
 
 
-def head_topk_b1(x, w, K, rows, bv, bh, ns):
-    """x [M, H], w [V, H] -> (vals [M, K], ids [M, K]); M <= rows."""
+def head_topk_b1(x, w, K, bv, bh, ns):
+    """x [M, H], w [V, H] -> (vals [M, K], ids [M, K])."""
     M = x.shape[0]
     NT = triton.cdiv(w.shape[0], bv)
     pv = torch.empty(M, NT, K, dtype=torch.float32, device=x.device)
     pi = torch.empty(M, NT, K, dtype=torch.int32, device=x.device)
     _head_topk[(NT,)](x, w, pv, pi, M, w.shape[0], K, NT,
-                      H=H, ROWS=rows, BV=bv, BH=bh, num_stages=ns)
+                      H=H, RC=16 if M <= 16 else 32, BV=bv, BH=bh,
+                      num_stages=ns)
     return merge(pv, pi, K)
 
 
@@ -178,11 +185,6 @@ def timed(fn, warmup=5, iters=30):
     return ts[0], ts[len(ts) // 2]
 
 
-def b1_budget(rows_m, bv):
-    """acc lives in registers: [ROWS, BV] fp32.  Cap at 64KB-ish."""
-    return rows_m * bv <= 64 * 256
-
-
 # (BV, BH, num_stages): BV=256 stages must stay low — the W tile is
 # BV*BH*2B per stage and sm_75 caps shared memory at 64KB.
 B1_CFGS = ((128, 128, 2), (256, 128, 1))
@@ -222,16 +224,13 @@ def run(base, x, w, w2, label, gates_only=False):
                   f"boundary ties {int(n_tie)}")
 
     fp32_logits = x.float() @ w.float().t()
-    max_m = min(128, triton.next_power_of_2(max(M, 16)))
     for K in [k for k in KS if k <= 128]:
         tref, iref = torch.topk(fp32_logits, K, dim=-1)
         det = (tref[:, 0] - tref[:, 1]).abs() > 1e-2
         ti16 = torch.topk((x @ w.t()), K, dim=-1).indices
         for bv, bh, ns in B1_CFGS:
-            if not b1_budget(max_m, bv):
-                continue
             try:
-                _, ids = head_topk_b1(x, w, K, max_m, bv, bh, ns)
+                _, ids = head_topk_b1(x, w, K, bv, bh, ns)
             except triton.OutOfResources as e:
                 # config does not fit this device's shared memory (e.g. the
                 # 2060's 64KB); not a logic failure — A3 has far more.
@@ -265,11 +264,9 @@ def run(base, x, w, w2, label, gates_only=False):
     out["head_gemm_torch"] = (mn, p50)
     for K in [k for k in KS if k <= 128]:
         for bv, bh, ns in B1_CFGS:
-            if not b1_budget(max_m, bv):
-                continue
             try:
                 mn, p50 = timed(lambda k=K, b=bv, h=bh, s=ns:
-                                head_topk_b1(x, w, k, max_m, b, h, s))
+                                head_topk_b1(x, w, k, b, h, s))
                 out[f"B1_fused_head_topk_K{K}_BV{bv}"] = (mn, p50)
             except Exception:  # noqa: BLE001
                 pass
