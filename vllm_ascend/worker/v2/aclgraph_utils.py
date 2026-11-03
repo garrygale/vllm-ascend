@@ -254,6 +254,24 @@ class ModelWithContext(nn.Module):
     def pure_draft_prefix_len(self) -> int:
         return self.original_model.pure_draft_prefix_len
 
+    @property
+    def shared_emb_readout(self) -> bool:
+        # The domino walks branch on this flag; the missing forwarding made
+        # capture record the non-shared walk for shared-readout checkpoints
+        # (corrected-step logits became 2*base + correction).
+        return self.original_model.shared_emb_readout
+
+    def __getattr__(self, name: str):
+        # Fallback for any other attribute the captured walk reads off the
+        # draft model, so a flag added later can't silently flip to its
+        # getattr() default inside capture.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name == "original_model":
+                raise
+            return getattr(self.original_model, name)
+
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)
 
