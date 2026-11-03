@@ -184,7 +184,14 @@ class AscendDominoSpeculator(DominoSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_i
             prefix_ids[:, 1 + i] = draft_i
 
-        gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
+        seed_ids = prefix_ids
+        if self.correction_warmup_len > 0:
+            # The warm-up ring was refreshed eagerly in propose(); the table
+            # GRU consumes ids, so prepend them to the prefix directly.
+            seed_ids = torch.cat(
+                [self._warmup_seed_ids[:num_reqs], prefix_ids], dim=1
+            )
+        gru_hidden = self.model.domino_optimized_prefix(seed_ids)
 
         if not shared:
             sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
