@@ -24,6 +24,8 @@ class AscendDominoSpeculator(DominoSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
+        self._correction_top_k = None
+        self._walk_mode_logged = False
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         super().init_cudagraph_manager(cudagraph_mode)
@@ -49,6 +51,16 @@ class AscendDominoSpeculator(DominoSpeculator):
                 "dflash_config.correction_top_k supports greedy drafting only "
                 "(draft_sample_method='probabilistic' caches the draft "
                 "distribution for the p/q test)"
+            )
+        # Resolve once here and carry it on the speculator: per-call
+        # getattr through self.model adds nothing and hides activation
+        # problems behind wrapper indirection.
+        self._correction_top_k = top_k
+        if top_k is not None:
+            print(
+                f"[AscendDomino] top-K correction walk ARMED (K={top_k}); "
+                f"the first draft step logs the executing mode",
+                flush=True,
             )
         return model
 
@@ -178,7 +190,15 @@ class AscendDominoSpeculator(DominoSpeculator):
             sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
             z_part = self.model.domino_z_part(sample_hidden_3d)
 
-        top_k = getattr(self.model, "correction_top_k", None)
+        top_k = self._correction_top_k
+        if not self._walk_mode_logged:
+            self._walk_mode_logged = True
+            print(
+                "[AscendDomino] walk mode executing: "
+                + (f"top-K (K={top_k})" if top_k is not None
+                   else "dense full-vocab correction"),
+                flush=True,
+            )
         if top_k is not None:
             if shared:
                 raise ValueError(
