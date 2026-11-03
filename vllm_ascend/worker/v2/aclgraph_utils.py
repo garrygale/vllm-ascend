@@ -226,6 +226,25 @@ class ModelWithContext(nn.Module):
     ):
         return self.original_model.domino_optimized_bias_and_gh(h, z_part_i)
 
+    def domino_optimized_u_and_gh(
+        self, h: torch.Tensor, z_part_i: torch.Tensor
+    ):
+        return self.original_model.domino_optimized_u_and_gh(h, z_part_i)
+
+    def domino_topk_weights(self, base_ids: torch.Tensor):
+        return self.original_model.domino_topk_weights(base_ids)
+
+    def domino_topk_step(
+        self,
+        u: torch.Tensor,
+        base_values: torch.Tensor,
+        base_ids: torch.Tensor,
+        cand_w: torch.Tensor,
+    ):
+        return self.original_model.domino_topk_step(
+            u, base_values, base_ids, cand_w
+        )
+
     def domino_optimized_cell(
         self, token_ids: torch.Tensor, h: torch.Tensor, gh: torch.Tensor
     ):
