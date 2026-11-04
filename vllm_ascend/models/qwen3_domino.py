@@ -46,6 +46,23 @@ def _correction_top_k_from_config(model) -> int | None:
     return top_k
 
 
+def _s_dim(model) -> int:
+    """Correction fc1 rows in the fused tables: 2*emb_dim gated, else emb_dim."""
+    return (2 if getattr(model, "correction_swiglu", False) else 1) * model.emb_dim
+
+
+def _correction_act(model, u: torch.Tensor) -> torch.Tensor:
+    """Correction bottleneck activation on the fc1 pre-activation ``u``.
+
+    ``correction_swiglu`` doubles fc1 to [gate; up] rows (s_proj / z_part are
+    already [B, 2M]); the legacy head keeps a plain SiLU on [B, M].
+    """
+    if getattr(model, "correction_swiglu", False):
+        gate, up = u.chunk(2, dim=-1)
+        return F.silu(gate) * up
+    return F.silu(u)
+
+
 class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     """Ascend Domino wrapper.
 
@@ -224,7 +241,10 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         print(msg, flush=True)
 
     def domino_z_part(self, sample_hidden: torch.Tensor) -> torch.Tensor:
-        """Precompute ``z @ W_z^T`` once per block: ``[B, steps, M]``."""
+        """Precompute ``z @ W_z^T`` once per block: ``[B, steps, S]``.
+
+        S is emb_dim, or 2*emb_dim under correction_swiglu (both fc1 halves).
+        """
         self._ensure_domino_triton_gru()
         return F.linear(sample_hidden, self._domino_w_z)
 
@@ -242,7 +262,7 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         )
         for t in range(token_ids.shape[1]):
             sh = F.linear(h[0], self._domino_w_sh)
-            gh = sh[:, self.model.emb_dim:]
+            gh = sh[:, _s_dim(self.model):]
             h = domino_gru_cell_triton_gather(
                 self._domino_gi_table, token_ids[:, t], gh, h
             )
@@ -255,20 +275,22 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Correction bias + shared hidden projection for one step.
 
-        ``sh = h @ W_sh^T`` is split into ``s_proj`` (correction) and ``gh``
-        (cell), so the two per-step h matmuls become one.
+        ``sh = h @ W_sh^T`` is split into ``s_proj`` (correction; emb_dim
+        rows, or 2*emb_dim under correction_swiglu) and ``gh`` (cell), so
+        the two per-step h matmuls become one.
         """
         self._ensure_domino_triton_gru()
-        sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
-        s_proj = sh[:, : self.model.emb_dim]
-        gh = sh[:, self.model.emb_dim:]
-        u = z_part_i + s_proj
+        sh = F.linear(h[0], self._domino_w_sh)  # [B, S + 3G]
+        gh = sh[:, _s_dim(self.model):]
+        u = z_part_i + sh[:, : _s_dim(self.model)]
         if self.model.shared_emb_readout:
             # u already carries base + correction in emb space; the folded
             # [V, emb] lm_head emits the final logits directly.
             bias = self.logits_processor(self.lm_head, u)
         else:
-            bias = self.logits_processor(self.model.embed_proj[2], F.silu(u))
+            bias = self.logits_processor(
+                self.model.embed_proj[2], _correction_act(self.model, u)
+            )
         return bias, gh
 
     def domino_optimized_u_and_gh(
@@ -283,10 +305,9 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
         on candidate rows only instead of the full-vocab fc2 GEMM.
         """
         self._ensure_domino_triton_gru()
-        sh = F.linear(h[0], self._domino_w_sh)  # [B, M + 3G]
-        s_proj = sh[:, : self.model.emb_dim]
-        gh = sh[:, self.model.emb_dim:]
-        return z_part_i + s_proj, gh
+        sh = F.linear(h[0], self._domino_w_sh)  # [B, S + 3G]
+        gh = sh[:, _s_dim(self.model):]
+        return z_part_i + sh[:, : _s_dim(self.model)], gh
 
     def domino_topk_weights(self, base_ids: torch.Tensor) -> torch.Tensor:
         """Gather the fc2 rows of every step's candidates at once.
@@ -312,13 +333,14 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
     ) -> torch.Tensor:
         """Greedy step over the base top-K candidates with pre-gathered rows.
 
-        ``u`` is the pre-activation correction input ([B, M]); the gathered
-        candidate rows [B, K, M] are dotted with SiLU(u), added to the base
-        values (logit_scale applied to the correction part only, matching
+        ``u`` is the pre-activation correction input ([B, M], or [B, 2M] with
+        correction_swiglu); the gathered candidate rows [B, K, M] are dotted
+        with the activated bottleneck, added to the base values (logit_scale
+        applied to the correction part only, matching
         ``logits_processor(embed_proj[2], ...)``), argmaxed over K.
         """
         self._ensure_domino_triton_gru()
-        h = F.silu(u)
+        h = _correction_act(self.model, u)
         scores = base_values.unsqueeze(-1).to(h.dtype).clone()
         scores.baddbmm_(
             cand_w, h.unsqueeze(-1), beta=1.0, alpha=self.logits_processor.scale
