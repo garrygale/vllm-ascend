@@ -41,6 +41,18 @@ class AscendDominoSpeculator(DominoSpeculator):
         model = super().load_draft_model(
             target_model, target_attn_layer_names
         )
+        # Version-skew guard: the checkpoint's hf_config asks for the warm-up
+        # but the base-vllm DominoSpeculator predates it (no attribute set in
+        # load_draft_model) — serving on would silently disable the warm-up
+        # the checkpoint was trained with. Requires vllm 11eb3896d0.
+        dfc = getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+        want_warmup = dfc.get("correction_warmup_len", 0)
+        if want_warmup and not int(getattr(self, "correction_warmup_len", 0)):
+            raise ValueError(
+                f"dflash_config.correction_warmup_len={want_warmup} requires a "
+                "vllm build with the domino warm-up speculator (>= 11eb3896d0); "
+                "this base vllm would silently disable the warm-up"
+            )
         # Build the triton-table eagerly now that embed/lm_head sharing is
         # done, so the one-time TP all-gather (TP>1) never runs inside ACL
         # graph capture.  ``_ensure_domino_triton_gru`` stays idempotent.
