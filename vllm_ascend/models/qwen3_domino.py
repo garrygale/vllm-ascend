@@ -209,17 +209,14 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
 
             if self.correction_top_k is not None and self._domino_corr_w2 is None:
                 # Full-vocab fc2 rows for the candidate-limited correction
-                # walk: gatherable rows must be rank-local, so the vocab
-                # shards are all-gathered once here (same trick as the
-                # gi_table) instead of a per-step collective.
+                # walk. embed_proj.2 is replicated (disable_tp), so the rows
+                # are already rank-local and gatherable without a collective.
                 fc2_w = self.model.embed_proj[2].weight.detach()
                 if not fc2_w.dtype.is_floating_point:
                     raise ValueError(
                         "dflash_config.correction_top_k needs an unquantized "
                         "embed_proj.2 weight"
                     )
-                if get_tensor_model_parallel_world_size() > 1:
-                    fc2_w = tensor_model_parallel_all_gather(fc2_w, dim=0)
                 self._domino_corr_w2 = fc2_w.contiguous()
 
         mb = (
