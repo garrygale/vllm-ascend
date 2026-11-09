@@ -47,6 +47,12 @@ TEMPERATURE = 0.0
 TOP_P = 1.0
 TOP_K = 0
 
+ENABLE_REASONING = False        # send reasoning_effort / thinking_token_budget
+                                # (requires USE_CHAT_TEMPLATE, server needs a
+                                # reasoning-capable template/parser)
+REASONING_EFFORT = "medium"     # none|minimal|low|medium|high|xhigh|max
+MAX_REASONING_TOKENS = None     # None = no cap; int = thinking_token_budget
+
 DATASET = "gsm8k"  # "humaneval", "gsm8k", "math500", "mbpp" or "oasst"
 DATASET_PATH = "/path/to/gsm8k_test.jsonl"
 
@@ -192,6 +198,9 @@ def send_completion(
     top_k: int,
     use_chat_template: bool,
     chat_template_kwargs: dict,
+    enable_reasoning: bool,
+    reasoning_effort: str,
+    max_reasoning_tokens: int | None,
 ) -> int:
     """POST /v1/completions and return the number of completion tokens."""
     if use_chat_template:
@@ -206,6 +215,10 @@ def send_completion(
             "stream": False,
             "chat_template_kwargs": chat_template_kwargs,
         }
+        if enable_reasoning:
+            payload["reasoning_effort"] = reasoning_effort
+            if max_reasoning_tokens is not None:
+                payload["thinking_token_budget"] = max_reasoning_tokens
     else:
         endpoint = "/v1/completions"
         payload = {
@@ -255,11 +268,40 @@ def main() -> None:
         help="send via /v1/chat/completions so the server applies the "
         "model's chat template",
     )
+    parser.add_argument(
+        "--enable-reasoning",
+        dest="enable_reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_REASONING,
+        help="send reasoning controls (reasoning_effort and "
+        "thinking_token_budget) with each request; requires "
+        "--use-chat-template (default: off)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        default=REASONING_EFFORT,
+        help="reasoning effort level, sent only when --enable-reasoning "
+        f"is set (default: {REASONING_EFFORT})",
+    )
+    parser.add_argument(
+        "--max-reasoning-tokens",
+        type=int,
+        default=MAX_REASONING_TOKENS,
+        help="max reasoning tokens (thinking_token_budget); None sends "
+        "no limit. Only sent when --enable-reasoning is set "
+        f"(default: {MAX_REASONING_TOKENS})",
+    )
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     args = parser.parse_args()
 
     if args.num_workers < 1:
         parser.error("--num-workers must be >= 1")
+    if args.enable_reasoning and not args.use_chat_template:
+        parser.error(
+            "--enable-reasoning requires --use-chat-template "
+            "(reasoning_effort is a chat-endpoint field)"
+        )
     if args.per_sample and args.num_workers > 1:
         parser.error(
             "--per-sample is not supported with --num-workers > 1 "
@@ -275,6 +317,16 @@ def main() -> None:
         f"temperature={args.temperature}  "
         f"top_p={args.top_p}  top_k={args.top_k}  "
         f"chat_template={args.use_chat_template}"
+        + (
+            f"  reasoning_effort={args.reasoning_effort}"
+            + (
+                f"  thinking_token_budget={args.max_reasoning_tokens}"
+                if args.max_reasoning_tokens is not None
+                else ""
+            )
+            if args.enable_reasoning
+            else ""
+        )
     )
     print(f"Dataset: {args.dataset} ({len(prompts)} prompts)")
 
@@ -316,6 +368,9 @@ def main() -> None:
                 args.top_k,
                 args.use_chat_template,
                 CHAT_TEMPLATE_KWARGS,
+                args.enable_reasoning,
+                args.reasoning_effort,
+                args.max_reasoning_tokens,
             )
             time.sleep(METRICS_SETTLE_SECONDS)
             after = fetch_spec_decode_metrics(base_url)
@@ -391,6 +446,9 @@ def main() -> None:
                     args.top_k,
                     args.use_chat_template,
                     CHAT_TEMPLATE_KWARGS,
+                    args.enable_reasoning,
+                    args.reasoning_effort,
+                    args.max_reasoning_tokens,
                 )
                 with print_lock:
                     print(f"[w{worker_id}] [{idx}/{len(prompts)}] {task_id}")
@@ -427,6 +485,11 @@ def main() -> None:
         "temperature": args.temperature,
         "top_p": args.top_p,
         "top_k": args.top_k,
+        "enable_reasoning": args.enable_reasoning,
+        "reasoning_effort": args.reasoning_effort if args.enable_reasoning else None,
+        "max_reasoning_tokens": (
+            args.max_reasoning_tokens if args.enable_reasoning else None
+        ),
         "dataset": args.dataset,
         "num_requests": len(prompts),
         "num_workers": args.num_workers,
