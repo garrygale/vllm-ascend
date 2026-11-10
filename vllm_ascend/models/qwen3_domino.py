@@ -115,7 +115,13 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
             emb_w = self.model.embed_tokens.weight.detach()  # [V, H]
 
             gi_local = F.linear(emb_w, w_ih).contiguous()
-            if get_tensor_model_parallel_world_size() > 1:
+            # The global TP group is the TARGET's; an unsharded draft
+            # (draft_tensor_parallel_size == 1) already carries the full
+            # replicated embedding, so no gather applies there.
+            if (
+                get_tensor_model_parallel_world_size() > 1
+                and not getattr(self.model, "draft_disable_tp", False)
+            ):
                 # Local vocab shards are contiguous slices of the padded
                 # vocab, so gathering in rank order reconstructs the full
                 # table; per-step gathers then stay local and collective-free.
