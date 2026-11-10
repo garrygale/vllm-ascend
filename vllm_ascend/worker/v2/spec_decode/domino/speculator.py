@@ -249,10 +249,15 @@ class AscendDominoSpeculator(DominoSpeculator):
                 i,
             )
             sampled_drafts.append(draft_i)
-        prefix_ids = torch.cat(
-            [anchor.view(-1, 1), torch.stack(sampled_drafts[:prefix_len], 1)],
-            dim=1,
-        )
+        if prefix_len:
+            prefix_ids = torch.cat(
+                [anchor.view(-1, 1), torch.stack(sampled_drafts, 1)],
+                dim=1,
+            )
+        else:
+            # pure_draft_prefix_len == 0: the GRU warm-up sees the anchor
+            # only (torch.stack of an empty list raises).
+            prefix_ids = anchor.view(-1, 1)
 
         gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
 
