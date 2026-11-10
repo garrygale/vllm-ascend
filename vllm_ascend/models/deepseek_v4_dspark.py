@@ -69,19 +69,16 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
 class DSparkMarkovHead(nn.Module):
     def __init__(self, config: PretrainedConfig, prefix: str) -> None:
         super().__init__()
-        # Both tables are replicated: the head runs sequentially for every
-        # draft position, and vocab shards would add an all-reduce and a
-        # full-vocab gather to each position.
-        self.markov_w1 = nn.Embedding(
+        self.markov_w1 = VocabParallelEmbedding(
             config.vocab_size,
             config.dspark_markov_rank,
+            prefix=f"{prefix}.markov_w1",
         )
         self.markov_w2 = ParallelLMHead(
             config.vocab_size,
             config.dspark_markov_rank,
             org_num_embeddings=config.vocab_size,
             prefix=f"{prefix}.markov_w2",
-            disable_tp=True,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
