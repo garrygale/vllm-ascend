@@ -1133,6 +1133,25 @@
 #    Future Plan:
 #       Remove this patch when vllm-ascend supports pattern matching for ops.*.
 #
+# ** 15a. File: worker/patch_qwen3_domino.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.models.qwen3_domino.Qwen3DominoModel.precompute_and_store_context_kv`
+#    Why:
+#       The 0.30 model ships a platform-neutral per-layer precompute
+#       (~5 dispatches x D layers per propose). The bf16 flare fusion
+#       (one hidden_norm + one bmm over stacked target K/V weights +
+#       grouped-k-norm Triton kernel + one fused RoPE) is a measured NPU
+#       win (0.26-era patch).
+#    How:
+#       Direct attribute replacement at worker init; bf16-gated (every
+#       k/v_target_proj must carry floating weights). QAT-quantized drafts
+#       fall back to the per-layer original, which routes the projections
+#       through their quant methods.
+#    Future Plan:
+#       Port the quantized fused path (npu_grouped_matmul + AICore
+#       arange*num_ctx group_list, 0.26 quantized branch) so W4A8 drafts
+#       keep the fused precompute too.
+#
 # ** 18. File: worker/patch_bind_kv_cache.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.utils.bind_kv_cache`
