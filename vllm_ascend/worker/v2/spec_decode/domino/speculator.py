@@ -236,14 +236,11 @@ class AscendDominoSpeculator(DominoSpeculator):
                 f"num_speculative_tokens ({n_spec})"
             )
 
+        # Column writes into draft_tokens/prefix_ids are per-step
+        # aclnnInplaceCopy ops on strided views; collect the sampled rows
+        # and write each buffer once as a contiguous block instead.
+        sampled_drafts = []
         anchor = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
-        prefix_ids = torch.empty(
-            num_reqs,
-            1 + prefix_len,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        prefix_ids[:, 0] = anchor
         for i in range(prefix_len):
             draft_i = self._sample_step(
                 base_logits[:, i],
@@ -251,17 +248,24 @@ class AscendDominoSpeculator(DominoSpeculator):
                 sample_pos[:, i],
                 i,
             )
-            self.draft_tokens[:num_reqs, i] = draft_i
-            prefix_ids[:, 1 + i] = draft_i
+            sampled_drafts.append(draft_i)
+        prefix_ids = torch.cat(
+            [anchor.view(-1, 1), torch.stack(sampled_drafts[:prefix_len], 1)],
+            dim=1,
+        )
 
         gru_hidden = self.model.domino_optimized_prefix(prefix_ids)
 
         sample_hidden_3d = sample_hidden.view(num_reqs, n_spec, -1)
-        z_part = self.model.domino_z_part(sample_hidden_3d)
+        # Step-major layout: one explicit transpose+contiguous here replaces
+        # the per-step strided slice z_part[:, i], which aclnn silently
+        # contiguous-copies (the [B, emb_dim] aclnnInplaceCopy_viewCopy seen
+        # before the fused GRU cell) on every correction step.
+        z_part = self.model.domino_z_part(sample_hidden_3d).transpose(0, 1).contiguous()
 
         for i in range(prefix_len, n_spec):
             bias, gh = self.model.domino_optimized_bias_and_gh(
-                gru_hidden, z_part[:, i]
+                gru_hidden, z_part[i]
             )
             logits_i = base_logits[:, i] + bias
             draft_i = self._sample_step(
@@ -270,11 +274,12 @@ class AscendDominoSpeculator(DominoSpeculator):
                 sample_pos[:, i],
                 i,
             )
-            self.draft_tokens[:num_reqs, i] = draft_i
+            sampled_drafts.append(draft_i)
             if i + 1 < n_spec:
                 gru_hidden = self.model.domino_optimized_cell(
                     draft_i, gru_hidden, gh
                 )
+        self.draft_tokens[:num_reqs] = torch.stack(sampled_drafts, dim=1)
 
     def propose(
         self,
