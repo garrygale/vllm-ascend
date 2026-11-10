@@ -5,9 +5,11 @@
 
 The native DynamicGRU (aclop) cannot be captured by ACL graph, and its fp16
 requirement forces dtype round-trips.  This kernel computes the GRU gates in
-the cell dtype (bf16, matching specforge's eagerGRU) with fp32-free elementwise
-math and ``care_padding=False`` on masked loads (triton-ascend vector-core
-optimization).  It is the validated winner from ``benchmarks/bench_gru_*``.
+the cell dtype (bf16, matching specforge's eagerGRU) with fp32-free elementwise math.
+It is the validated winner from ``benchmarks/bench_gru_*``.  (The old
+triton-ascend ``care_padding=False`` vector-core hint died with
+triton-ascend 3.6; masked lanes are never stored, so plain masked loads
+are correct on every version.)
 """
 
 import torch
@@ -40,8 +42,7 @@ def _fused_gru_cell_kernel(
         z = sigmoid(gi_z + gh_z)
         n = tanh(gi_n + r * gh_n)   (via 2*sigmoid(2x)-1)
         h_new = (1 - z) * n + z * h
-    Masked lanes are elementwise-independent and never stored, so
-    ``care_padding=False`` is safe.
+    Masked lanes are elementwise-independent and never stored.
     """
     pid_b = tl.program_id(0)
     pid_g = tl.program_id(1)
@@ -51,37 +52,30 @@ def _fused_gru_cell_kernel(
     h_state = tl.load(
         h_ptr + pid_b * stride_h_b + offs_g * stride_h_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_r = tl.load(
         gi_ptr + pid_b * stride_gi_b + offs_g * stride_gi_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_z = tl.load(
         gi_ptr + pid_b * stride_gi_b + (G + offs_g) * stride_gi_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_n = tl.load(
         gi_ptr + pid_b * stride_gi_b + (2 * G + offs_g) * stride_gi_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_r = tl.load(
         gh_ptr + pid_b * stride_gh_b + offs_g * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_z = tl.load(
         gh_ptr + pid_b * stride_gh_b + (G + offs_g) * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_n = tl.load(
         gh_ptr + pid_b * stride_gh_b + (2 * G + offs_g) * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
 
     r = tl.sigmoid(gi_r + gh_r)
@@ -178,37 +172,30 @@ def _fused_gru_cell_gather_kernel(
     h_state = tl.load(
         h_ptr + pid_b * stride_h_b + offs_g * stride_h_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_r = tl.load(
         gi_table_ptr + gi_base + offs_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_z = tl.load(
         gi_table_ptr + gi_base + G + offs_g,
         mask=mask_g,
-        care_padding=False,
     )
     gi_n = tl.load(
         gi_table_ptr + gi_base + 2 * G + offs_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_r = tl.load(
         gh_ptr + pid_b * stride_gh_b + offs_g * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_z = tl.load(
         gh_ptr + pid_b * stride_gh_b + (G + offs_g) * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
     gh_n = tl.load(
         gh_ptr + pid_b * stride_gh_b + (2 * G + offs_g) * stride_gh_g,
         mask=mask_g,
-        care_padding=False,
     )
 
     r = tl.sigmoid(gi_r + gh_r)
