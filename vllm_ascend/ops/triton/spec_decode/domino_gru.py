@@ -4,8 +4,10 @@
 """Triton-fused Domino GRU cell for Ascend NPU.
 
 The native DynamicGRU (aclop) cannot be captured by ACL graph, and its fp16
-requirement forces dtype round-trips.  This kernel computes the GRU gates in
-the cell dtype (bf16, matching specforge's eagerGRU) with fp32-free elementwise math.
+requirement forces dtype round-trips.  The kernel loads/stores the cell dtype
+(bf16, matching specforge's eagerGRU); the gate math itself runs in fp32
+(triton-ascend 3.6 restricts sigmoid/exp to fp32 inputs, and torch computes
+bf16 sigmoid in fp32 internally anyway).
 It is the validated winner from ``benchmarks/bench_gru_*``.  (The old
 triton-ascend ``care_padding=False`` vector-core hint died with
 triton-ascend 3.6; masked lanes are never stored, so plain masked loads
@@ -37,7 +39,8 @@ def _fused_gru_cell_kernel(
 ):
     """Fused GRU cell: gi/gh already contain the input/hidden projections.
 
-    Gates stay in the cell dtype (bf16) like specforge's eagerGRU:
+    Loads/stores keep the cell dtype (bf16); the gate sums are cast to
+    fp32 for sigmoid (triton-ascend 3.6 dtype rule), like specforge's eagerGRU:
         r = sigmoid(gi_r + gh_r)
         z = sigmoid(gi_z + gh_z)
         n = tanh(gi_n + r * gh_n)   (via 2*sigmoid(2x)-1)
@@ -78,10 +81,14 @@ def _fused_gru_cell_kernel(
         mask=mask_g,
     )
 
-    r = tl.sigmoid(gi_r + gh_r)
-    z = tl.sigmoid(gi_z + gh_z)
-    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n)) - 1.0
-    h_new = (1.0 - z) * n + z * h_state
+    # Gate math runs in fp32: triton-ascend 3.6 restricts tl.sigmoid/exp to
+    # fp32/fp64 inputs (_check_dtype), so the bf16 cell sums are cast up
+    # here and the result cast back at the store. This also matches
+    # eagerGRU closer (torch computes bf16 sigmoid in fp32 internally).
+    r = tl.sigmoid((gi_r + gh_r).to(tl.float32))
+    z = tl.sigmoid((gi_z + gh_z).to(tl.float32))
+    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n.to(tl.float32)).to(tl.float32)) - 1.0
+    h_new = (1.0 - z) * n + z * h_state.to(tl.float32)
 
     tl.store(
         h_out_ptr + pid_b * stride_hout_b + offs_g * stride_hout_g,
@@ -198,10 +205,14 @@ def _fused_gru_cell_gather_kernel(
         mask=mask_g,
     )
 
-    r = tl.sigmoid(gi_r + gh_r)
-    z = tl.sigmoid(gi_z + gh_z)
-    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n)) - 1.0
-    h_new = (1.0 - z) * n + z * h_state
+    # Gate math runs in fp32: triton-ascend 3.6 restricts tl.sigmoid/exp to
+    # fp32/fp64 inputs (_check_dtype), so the bf16 cell sums are cast up
+    # here and the result cast back at the store. This also matches
+    # eagerGRU closer (torch computes bf16 sigmoid in fp32 internally).
+    r = tl.sigmoid((gi_r + gh_r).to(tl.float32))
+    z = tl.sigmoid((gi_z + gh_z).to(tl.float32))
+    n = 2.0 * tl.sigmoid(2.0 * (gi_n + r * gh_n.to(tl.float32)).to(tl.float32)) - 1.0
+    h_new = (1.0 - z) * n + z * h_state.to(tl.float32)
     tl.store(
         h_out_ptr + pid_b * stride_hout_b + offs_g * stride_hout_g,
         h_new.to(h_ptr.dtype.element_ty),
