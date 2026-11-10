@@ -70,6 +70,14 @@ class AscendQwen3DominoForCausalLM(Qwen3DominoForCausalLM):
                 flush=True,
             )
 
+        # bf16 fused qkv + split_qkv_rmsnorm_rope per attention layer
+        # (quantized layers self-exclude inside the builder).
+        from vllm_ascend.patch.worker.patch_qwen3_domino import (
+            build_bf16_fused_qkv,
+        )
+
+        build_bf16_fused_qkv(self.model)
+
     def _validate_domino_triton_gru(self) -> None:
         """Validate the triton-table path.
 

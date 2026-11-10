@@ -34,7 +34,15 @@ with it.
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.models.qwen3_domino import Qwen3DominoModel
+from vllm.model_executor.models.qwen3_domino import (
+    DominoQwen3Attention,
+    Qwen3DominoModel,
+)
+
+try:
+    from vllm_ascend.device.device_op import DeviceOperator
+except Exception:  # pragma: no cover
+    DeviceOperator = None
 
 try:
     from vllm_ascend.ops.triton.spec_decode.domino_kv_utils import (
@@ -46,6 +54,62 @@ except Exception:  # pragma: no cover - triton unavailable on some builds
 logger = init_logger(__name__)
 
 _ORIGINAL_PRECOMPUTE = Qwen3DominoModel.precompute_and_store_context_kv
+_ORIGINAL_ATTN_FORWARD = DominoQwen3Attention.forward
+
+
+def build_bf16_fused_qkv(model) -> None:
+    """Attach a per-layer fused bf16 qkv GEMM operand to every attention.
+
+    bf16 ONLY (QAT-quantized layers keep the module forward so their quant
+    methods keep routing; the packed fused-qkv schemes ride with the
+    quantized-precompute TODO). The model's fused qkv_proj already holds
+    [q; k; v] rows -- only the [in, out] transposed GEMM operand and a bf16
+    cos/sin copy are cached per layer.
+    """
+    for layer in model.layers:
+        attn = layer.self_attn
+        attn._qkv_fused = False
+        if DeviceOperator is None:
+            continue
+        w = attn.qkv_proj.weight
+        if w is None or not w.data.is_floating_point():
+            continue  # quantized projection: module forward stays
+        attn._fused_qkv_weight = w.data.t().contiguous()
+        attn._fused_qkv_cos_sin_cache = (
+            attn.rotary_emb.cos_sin_cache.to(torch.bfloat16).contiguous()
+        )
+        attn._qkv_fused = True
+
+
+def _ascend_domino_attention_forward(
+    self: DominoQwen3Attention,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+):
+    """Fused qkv GEMM + split_qkv_rmsnorm_rope (split, q/k RMSNorm and RoPE
+    in one kernel). The compiled-pattern route needs piecewise compile,
+    which the ACL-graph draft path does not run; the explicit
+    DeviceOperator call is the eager/graph-safe form glm5next-class models
+    use. Quantized layers fall back to the module forward."""
+    if not getattr(self, "_qkv_fused", False):
+        return _ORIGINAL_ATTN_FORWARD(self, positions, hidden_states)
+    qkv = torch.matmul(hidden_states, self._fused_qkv_weight)
+    q, k, v = DeviceOperator.split_qkv_rmsnorm_rope(
+        qkv,
+        self.q_norm.weight,
+        self.k_norm.weight,
+        self.q_size,
+        self.kv_size,
+        self.head_dim,
+        self.q_norm.variance_epsilon,
+        None,
+        None,
+        self._fused_qkv_cos_sin_cache,
+        positions,
+    )
+    attn_output = self.attn(q, k, v)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def _build_bf16_fused_kv_buffers(model) -> None:
@@ -174,7 +238,8 @@ def precompute_and_store_context_kv(
 
 
 Qwen3DominoModel.precompute_and_store_context_kv = precompute_and_store_context_kv
+DominoQwen3Attention.forward = _ascend_domino_attention_forward
 logger.info_once(
-    "Domino bf16 fused flare context-KV precompute installed "
-    "(quantized drafts fall back to the per-layer path)"
+    "Domino bf16 fused flare context-KV precompute + fused qkv/split-norm-rope "
+    "attention installed (quantized drafts fall back to the per-layer paths)"
 )
